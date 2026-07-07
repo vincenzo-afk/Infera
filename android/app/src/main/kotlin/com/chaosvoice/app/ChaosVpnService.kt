@@ -87,9 +87,11 @@ class ChaosVpnService : VpnService() {
                 .setSession("ChaosVoice Survival")
                 // Loopback-range address — not globally routable
                 .addAddress("127.0.0.2", 32)
+                // Bug fix: add a route to a dummy IP (TEST-NET-1 documentation range) so the OS
+                // sees the VPN as active and doesn't discard it as empty, while keeping normal routing safe.
+                .addRoute("192.0.2.1", 32)
                 // All apps bypass this VPN by default; no traffic is ever tunnelled
                 .allowBypass()
-                // No addRoute() — kernel never forwards packets through this interface
                 .establish()
             isEstablished = vpnInterface != null
             Log.i(TAG, "VPN interface established (survival anchor, no routing): isEstablished=$isEstablished")

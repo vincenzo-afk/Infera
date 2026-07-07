@@ -201,18 +201,22 @@ class _ActiveStateBanner extends StatelessWidget {
         label    = '🔴  CHAOS MODE ACTIVE';
         bgColor  = colors.primary;
         showPulse= true;
+        break;
       case AppState.paused:
         label    = '⏸  PAUSED — incoming audio priority';
         bgColor  = const Color(0xFFE65100);
         showPulse= false;
+        break;
       case AppState.initializing:
         label    = '⏳  STARTING…';
         bgColor  = const Color(0xFF424242);
         showPulse= false;
+        break;
       case AppState.failure:
         label    = '⚠️  ERROR — see below';
         bgColor  = colors.error;
         showPulse= false;
+        break;
       default:
         return const SizedBox.shrink();  // No banner when idle/stopped
     }

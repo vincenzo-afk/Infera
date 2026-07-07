@@ -87,49 +87,69 @@ class ChaosProjectionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null  // Not a bound service
 
+    private val commandReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action
+            if (action == "com.chaosvoice.app.UPDATE_PARAMETER") {
+                val stageKey = intent.getStringExtra("stage") ?: return
+                val value    = intent.getFloatExtra("value", 0f)
+                val stage    = ChaosDSP.Stage.fromKey(stageKey)
+                if (stage != null) dsp.setParameter(stage, value)
+            } else if (action == "com.chaosvoice.app.LOAD_PRESET") {
+                val pid = intent.getStringExtra("presetId") ?: return
+                dsp.loadPreset(Preset.builtInById(pid))
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
         focusManager = AudioFocusManager(this) { focusChange -> onFocusChanged(focusChange) }
+        
+        // Register local command receiver to avoid startService background restrictions
+        val filter = android.content.IntentFilter().apply {
+            addAction("com.chaosvoice.app.UPDATE_PARAMETER")
+            addAction("com.chaosvoice.app.LOAD_PRESET")
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(commandReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(commandReceiver, filter)
+        }
         Log.i(TAG, "ChaosProjectionService created")
     }
 
-    /**
-     * Entry point for all service state transitions.
-     * Returns [START_STICKY] so Android attempts to restart if killed (15_BACKGROUND_SERVICE.md).
-     * On restart, returns to STOPPED — does NOT silently resume audio (transparency principle).
-     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Handle mid-session parameter/preset updates from MainActivity
-        val action = intent?.getStringExtra("action")
-        if (action == "updateParameter") {
-            val stageKey = intent.getStringExtra("stage") ?: return START_STICKY
-            val value    = intent.getFloatExtra("value", 0f)
-            val stage    = ChaosDSP.Stage.fromKey(stageKey)
-            if (stage != null) dsp.setParameter(stage, value)
-            return START_STICKY
-        }
-        if (action == "loadPreset") {
-            val pid = intent?.getStringExtra("presetId") ?: return START_STICKY
-            dsp.loadPreset(Preset.builtInById(pid))
-            return START_STICKY
+        val targetState = intent?.getStringExtra(EXTRA_TARGET_STATE) ?: STATE_INIT
+
+        // Bug fix: if targetState is STOPPED, we must call startForeground immediately
+        // to satisfy startForegroundService() OS contract, then shut down to avoid crashes.
+        if (targetState == STATE_STOPPED) {
+            startForeground(NOTIFICATION_ID, buildNotification("Stopping ChaosVoice…"))
+            cleanupAndStop()
+            return START_NOT_STICKY
         }
 
-        val targetState = intent?.getStringExtra(EXTRA_TARGET_STATE) ?: STATE_INIT
-        val presetId    = intent?.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
-        val boost       = intent?.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
-                          ?: Preset.DEMON.boostPercent
+        val presetId = intent?.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
+        
+        // Bug fix: getFloatExtra returns primitive, so safe-check intent instead of unreachable ?: fallback
+        val boost = if (intent != null) {
+            intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
+        } else {
+            Preset.DEMON.boostPercent
+        }
 
         Log.i(TAG, "onStartCommand targetState=$targetState presetId=$presetId boost=$boost")
 
         when (targetState) {
             STATE_INIT    -> transitionToInit()
             STATE_ACTIVE  -> transitionToActive(presetId, boost)
-            STATE_STOPPED -> cleanupAndStop()
         }
 
         return START_STICKY
     }
+
 
     // ─────────────────────────────────────────────────────────────────────────
     // State transitions
@@ -271,68 +291,77 @@ class ChaosProjectionService : Service() {
      * Starts the audio capture → DSP → playback loop on a dedicated high-priority thread.
      * Thread priority: THREAD_PRIORITY_URGENT_AUDIO (13_THREADING_MODEL.md).
      */
+
     private fun startProcessingLoop() {
         isRunning.set(true)
         audioThread = Thread {
-            // Bug fix: wrap setThreadPriority — some OEMs restrict URGENT_AUDIO for
-            // third-party apps and throw a SecurityException instead of silently failing.
             try {
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-                Log.i(TAG, "Audio thread priority set to URGENT_AUDIO (tid=${Process.myTid()})")
-            } catch (e: Exception) {
-                // Degrade gracefully to AUDIO (still higher than default)
-                try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) } catch (_: Exception) {}
-                Log.w(TAG, "Could not set URGENT_AUDIO priority; degraded to AUDIO: ${e.message}")
-            }
-
-            val captureBuffer = ShortArray(BUFFER_SIZE_SAMPLES)
-            audioRecord?.startRecording()
-            audioTrack?.play()
-
-            var bufferCount = 0
-
-            while (isRunning.get()) {
+                // Bug fix: wrap setThreadPriority — some OEMs restrict URGENT_AUDIO for
+                // third-party apps and throw a SecurityException instead of silently failing.
                 try {
-                    val read = audioRecord?.read(captureBuffer, 0, BUFFER_SIZE_SAMPLES) ?: -1
-                    if (read <= 0) {
-                        // Underrun — skip gracefully, do not desync timing (10_AUDIO_PIPELINE.md)
-                        Log.d(TAG, "AudioRecord read returned $read (underrun/overrun), skipping")
-                        continue
-                    }
-
-                    // ── DSP chain runs in Kotlin only (ADR-001) ─────────────
-                    val processed = dsp.process(captureBuffer)
-
-                    // Write to loudspeaker via AudioTrack
-                    audioTrack?.write(processed, 0, read)
-
-                    // ── Wake lock renewal (bug fix: prevent silent expiry on long sessions)
-                    // Renew every WAKE_LOCK_RENEW_INTERVAL_BUFFERS (~10 min) so we never
-                    // rely on a timed lease that expires mid-session.
-                    bufferCount++
-                    if (bufferCount >= WAKE_LOCK_RENEW_INTERVAL_BUFFERS) {
-                        bufferCount = 0
-                        val wl = wakeLock
-                        if (wl != null && wl.isHeld) {
-                            wl.release()
-                            @Suppress("WakelockTimeout")
-                            wl.acquire()
-                            Log.d(TAG, "Wake lock renewed")
-                        }
-                    }
-
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                    Log.i(TAG, "Audio thread priority set to URGENT_AUDIO (tid=${Process.myTid()})")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Audio loop error: ${e.message}", e)
-                    // Fail down cleanly — never crash the app (25_ERROR_HANDLING.md)
-                    Handler(Looper.getMainLooper()).post {
-                        broadcastError("AUDIO_INIT_FAILED", "Audio pipeline error. Please restart.")
-                        cleanupAndStop()
-                    }
-                    break
+                    // Degrade gracefully to AUDIO (still higher than default)
+                    try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) } catch (_: Exception) {}
+                    Log.w(TAG, "Could not set URGENT_AUDIO priority; degraded to AUDIO: ${e.message}")
                 }
-            }
 
-            Log.i(TAG, "Audio thread stopped")
+                val captureBuffer = ShortArray(BUFFER_SIZE_SAMPLES)
+                audioRecord?.startRecording()
+                audioTrack?.play()
+
+                var bufferCount = 0
+
+                while (isRunning.get()) {
+                    try {
+                        val read = audioRecord?.read(captureBuffer, 0, BUFFER_SIZE_SAMPLES) ?: -1
+                        if (read <= 0) {
+                            // Underrun — skip gracefully, do not desync timing (10_AUDIO_PIPELINE.md)
+                            Log.d(TAG, "AudioRecord read returned $read (underrun/overrun), skipping")
+                            continue
+                        }
+
+                        // ── DSP chain runs in Kotlin only (ADR-001) ─────────────
+                        val processed = dsp.process(captureBuffer)
+
+                        // Write to loudspeaker via AudioTrack
+                        audioTrack?.write(processed, 0, read)
+
+                        // ── Wake lock renewal (bug fix: prevent silent expiry on long sessions)
+                        // Renew every WAKE_LOCK_RENEW_INTERVAL_BUFFERS (~10 min) so we never
+                        // rely on a timed lease that expires mid-session.
+                        bufferCount++
+                        if (bufferCount >= WAKE_LOCK_RENEW_INTERVAL_BUFFERS) {
+                            bufferCount = 0
+                            val wl = wakeLock
+                            if (wl != null && wl.isHeld) {
+                                wl.release()
+                                @Suppress("WakelockTimeout")
+                                wl.acquire()
+                                Log.d(TAG, "Wake lock renewed")
+                            }
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Audio loop error: ${e.message}", e)
+                        // Fail down cleanly — never crash the app (25_ERROR_HANDLING.md)
+                        Handler(Looper.getMainLooper()).post {
+                            broadcastError("AUDIO_INIT_FAILED", "Audio pipeline error. Please restart.")
+                            cleanupAndStop()
+                        }
+                        break
+                    }
+                }
+            } finally {
+                // Bug fix: ensure wake lock is always released on thread termination to prevent leaks
+                val wl = wakeLock
+                if (wl != null && wl.isHeld) {
+                    wl.release()
+                    Log.i(TAG, "Wake lock released inside thread finally block")
+                }
+                Log.i(TAG, "Audio thread stopped")
+            }
         }.also {
             it.name = "ChaosVoice-Audio"
             it.start()
@@ -357,7 +386,11 @@ class ChaosProjectionService : Service() {
         audioTrack = null
 
         focusManager.abandonFocus()
-        wakeLock?.release()
+        // Bug fix: safely release wake lock checking isHeld to avoid under-locked exception
+        val wl = wakeLock
+        if (wl != null && wl.isHeld) {
+            wl.release()
+        }
         wakeLock = null
 
         dsp.reset()   // clear stateful buffers for next session
@@ -423,6 +456,14 @@ class ChaosProjectionService : Service() {
 
     override fun onDestroy() {
         stopProcessingLoop()
+        // Bug fix: ensure STATE_STOPPED is broadcast even when stopped via stopService()
+        serviceState = ServiceState.STOPPED
+        broadcastStateChange(STATE_STOPPED)
+        try {
+            unregisterReceiver(commandReceiver)
+        } catch (e: Exception) {
+            // Ignore
+        }
         Log.i(TAG, "ChaosProjectionService destroyed")
         super.onDestroy()
     }

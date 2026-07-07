@@ -156,7 +156,8 @@ class MainActivity : FlutterActivity() {
             // ── stopChaosMode ────────────────────────────────────────────
             "stopChaosMode" -> {
                 try {
-                    startChaosService(ChaosProjectionService.STATE_STOPPED)
+                    val intent = Intent(this, ChaosProjectionService::class.java)
+                    stopService(intent)
                     result.success(true)
                 } catch (e: Exception) {
                     Log.e(TAG, "stopChaosMode failed: ${e.message}")
@@ -262,21 +263,20 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun sendParameterUpdate(stageKey: String, value: Float) {
-        // Broadcast to running service via a global intent with extras
-        val intent = Intent(this, ChaosProjectionService::class.java).apply {
-            putExtra("action", "updateParameter")
+        val intent = Intent("com.chaosvoice.app.UPDATE_PARAMETER").apply {
+            `package` = packageName
             putExtra("stage", stageKey)
             putExtra("value", value)
         }
-        startService(intent)
+        sendBroadcast(intent)
     }
 
     private fun sendPresetLoad(presetId: String) {
-        val intent = Intent(this, ChaosProjectionService::class.java).apply {
-            putExtra("action", "loadPreset")
+        val intent = Intent("com.chaosvoice.app.LOAD_PRESET").apply {
+            `package` = packageName
             putExtra("presetId", presetId)
         }
-        startService(intent)
+        sendBroadcast(intent)
     }
 
     // ─────────────────────────────────────────────────────────────────────────

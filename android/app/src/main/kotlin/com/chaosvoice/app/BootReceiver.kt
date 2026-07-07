@@ -30,8 +30,9 @@ class BootReceiver : BroadcastReceiver() {
 
         Log.i(TAG, "BOOT_COMPLETED received")
 
-        val prefs: SharedPreferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val vpnEnabled = prefs.getBoolean(KEY_VPN_ENABLED, false)
+        // Bug fix: Flutter shared_preferences plugin uses "FlutterSharedPreferences" and prefixes all keys with "flutter."
+        val prefs: SharedPreferences = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val vpnEnabled = prefs.getBoolean("flutter.$KEY_VPN_ENABLED", false)
 
         if (vpnEnabled) {
             Log.i(TAG, "VPN survival service was enabled by user — re-arming after boot")

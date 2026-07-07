@@ -109,13 +109,16 @@ class ChaosController extends ChangeNotifier {
         switch (type) {
           case 'onServiceStateChanged':
             _handleServiceStateChanged(event['state'] as String? ?? 'STOPPED');
+            break;
           case 'onAudioFocusChanged':
             _handleFocusChanged(event['focusState'] as String? ?? 'LOST');
+            break;
           case 'onError':
             _handleNativeError(
               event['code'] as String? ?? 'UNKNOWN',
               event['message'] as String? ?? 'An error occurred.',
             );
+            break;
         }
       },
       onError: (e) {
@@ -133,11 +136,14 @@ class ChaosController extends ChangeNotifier {
     switch (nativeState) {
       case 'INIT':
         _setAppState(AppState.initializing);
+        break;
       case 'ACTIVE':
         _setAppState(AppState.running);
         _clearError();
+        break;
       case 'STOPPED':
         _setAppState(AppState.stopped);
+        break;
     }
   }
 
@@ -145,10 +151,13 @@ class ChaosController extends ChangeNotifier {
     switch (focusState) {
       case 'GAINED':
         if (_appState == AppState.paused) _setAppState(AppState.running);
+        break;
       case 'LOST_TRANSIENT':
         if (_appState == AppState.running) _setAppState(AppState.paused);
+        break;
       case 'LOST':
         _setAppState(AppState.stopped);
+        break;
     }
   }
 
@@ -282,6 +291,13 @@ class ChaosController extends ChangeNotifier {
   Future<void> updateParameter(String stageKey, double value) async {
     // Update live params in state (for UI reflection)
     _liveParams = _applyParam(_liveParams, stageKey, value);
+    
+    // Bug fix: keep the quick boost level (Home Screen) and advanced parameter boost level in sync
+    if (stageKey == 'boostPercent') {
+      _boostLevel = value;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble('boost_level', value);
+    }
 
     if (isActive) {
       try {
@@ -364,8 +380,6 @@ class ChaosController extends ChangeNotifier {
 
     _vpnSurvivalEnabled = enabled;
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('vpn_survival_enabled', enabled);
-    // Also persist for BootReceiver
     await prefs.setBool('vpn_survival_enabled', enabled);
     notifyListeners();
   }
