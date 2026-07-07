@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ChaosVoice</string>
+    <string name="notification_channel_name">ChaosVoice Active Session</string>
+    <string name="notification_channel_desc">Shown while ChaosVoice is processing your voice</string>
+    <!-- Permission rationale strings (25_ERROR_HANDLING.md) -->
+    <string name="perm_mic_rationale">Microphone access is needed to use ChaosVoice. Tap to grant.</string>
+    <string name="perm_notification_rationale">Notification permission is required for ChaosVoice to run in the background.</string>
+    <string name="perm_battery_rationale">Battery optimization exemption helps keep your session stable in the background.</string>
+    <!-- Error messages -->
+    <string name="err_audio_record_init">Couldn\'t access the microphone. Try restarting the app.</string>
+    <string name="err_audio_track_init">Couldn\'t start audio playback. Please try again.</string>
+    <string name="err_focus_denied">Another app is using audio right now.</string>
+    <string name="err_preset_load">Couldn\'t load that preset — reverted to default.</string>
+    <string name="err_preset_save">Couldn\'t save preset. Please try again.</string>
+</resources>

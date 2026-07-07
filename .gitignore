@@ -1,0 +1,46 @@
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+*.iml
+
+# Android
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/debug.apk
+android/app/release/
+android/captures/
+android/**/*.class
+android/**/*.jar
+android/**/*.ap_
+android/app/.cxx/
+*.keystore
+
+# iOS
+ios/Flutter/App.framework
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/Generated.xcconfig
+ios/Flutter/app.flx
+ios/Flutter/app.zip
+ios/Flutter/flutter_assets/
+ios/.symlinks/
+ios/Pods/
+ios/Runner.xcworkspace/
+
+# IDE
+.idea/
+*.iws
+*.ipr
+*.iml
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

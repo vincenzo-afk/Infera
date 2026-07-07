@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    ChaosVoice AndroidManifest.xml
+    Permissions declared per 14_PERMISSION_MODEL.md.
+    Service types declared per Android 14 foreground-service requirements.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.chaosvoice.app">
+
+    <!-- ── Core audio permissions ─────────────────────────────────────── -->
+
+    <!-- Microphone capture — runtime-requested at first Chaos Mode activation -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Adjust output routing/speakerphone — normal permission, auto-granted -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+    <!-- ── Foreground service permissions ────────────────────────────── -->
+
+    <!-- Required to keep audio pipeline alive while backgrounded -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Android 14+ requirement for mic-using foreground services -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- ── Notification permission (Android 13+) ─────────────────────── -->
+    <!-- Requested at runtime as first step in permission sequence (ADR-004) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- ── Background stability permissions ──────────────────────────── -->
+
+    <!-- Prevent CPU sleep during active audio processing session -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Request exemption from battery optimizations — asked at runtime -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Device boot — re-arm VPN survival service if user had it enabled -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- ── Optional VPN survival service ─────────────────────────────── -->
+    <!-- Only used if user enables "Enhanced Background Mode" in settings -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
+
+    <!-- Internet not needed — all processing is local per 28_SECURITY.md -->
+
+    <application
+        android:name="${applicationName}"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:supportsRtl="true"
+        android:theme="@style/LaunchTheme">
+
+        <!-- ── Main Activity ──────────────────────────────────────────── -->
+        <!--
+            singleInstance prevents stacking multiple instances across permission dialog
+            transitions, per 08_CLASS_SPECIFICATION.md MainActivity lifecycle note.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleInstance"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ── ChaosProjectionService ─────────────────────────────────── -->
+        <!--
+            Foreground service owning the live audio pipeline.
+            Type="microphone" required on Android 14+ per 14_PERMISSION_MODEL.md.
+        -->
+        <service
+            android:name=".ChaosProjectionService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- ── ChaosVpnService ────────────────────────────────────────── -->
+        <!--
+            Optional background-survival helper.
+            User must explicitly enable it in Settings; not auto-started.
+            permission required so only the system can bind to it.
+        -->
+        <service
+            android:name=".ChaosVpnService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+
+        <!-- ── BootReceiver ───────────────────────────────────────────── -->
+        <!--
+            Re-arms ChaosVpnService after device reboot if user had it enabled.
+            Does NOT silently resume audio processing (transparency principle).
+        -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

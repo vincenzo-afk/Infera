@@ -1,0 +1,33 @@
+name: chaosvoice
+description: >
+  Real-time voice-effects app using a 14-stage DSP chain and acoustic loopback
+  to alter the user's voice during VoIP calls — no root required.
+version: 1.0.0+1
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # Lightweight settings persistence (last preset, boost level, flags)
+  shared_preferences: ^2.2.3
+  # ChangeNotifier-based state management (ADR-003)
+  provider: ^6.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Built-in preset parameter files — loaded on first run
+  assets:
+    - assets/presets/demon.json
+    - assets/presets/robot.json
+    - assets/presets/crushed_radio.json
+    - assets/presets/glitch.json

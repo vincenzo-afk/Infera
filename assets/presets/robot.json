@@ -1,0 +1,21 @@
+{
+  "id": "robot",
+  "name": "Robot",
+  "isBuiltIn": true,
+  "eqFrequency": 2600,
+  "eqQ": 5.0,
+  "noiseMix": 0.10,
+  "saturation1Gain": 3.0,
+  "delayTimeMs": 10,
+  "delayFeedback": 0.30,
+  "saturation2Gain": 1.5,
+  "ringModHz": 900,
+  "bitCrushDepth": 8,
+  "sampleRateTargetHz": 16000,
+  "pitchWobbleRateHz": 0,
+  "pitchWobbleDepth": 0,
+  "vocoderMix": 0.80,
+  "burstProbability": 0.01,
+  "hardClipThreshold": 0.50,
+  "boostPercent": 150
+}

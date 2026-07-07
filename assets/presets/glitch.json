@@ -1,0 +1,21 @@
+{
+  "id": "glitch",
+  "name": "Glitch",
+  "isBuiltIn": true,
+  "eqFrequency": 3000,
+  "eqQ": 4.0,
+  "noiseMix": 0.40,
+  "saturation1Gain": 8.0,
+  "delayTimeMs": 20,
+  "delayFeedback": 0.50,
+  "saturation2Gain": 4.0,
+  "ringModHz": 600,
+  "bitCrushDepth": 3,
+  "sampleRateTargetHz": 8000,
+  "pitchWobbleRateHz": 8.0,
+  "pitchWobbleDepth": 0.20,
+  "vocoderMix": 0.20,
+  "burstProbability": 0.10,
+  "hardClipThreshold": 0.25,
+  "boostPercent": 175
+}
