@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../chaos_controller.dart';
@@ -28,22 +29,22 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
 
     final controller = context.read<ChaosController>();
 
-    // The actual permission sequence is handled inside toggleChaosMode / startChaosMode.
-    // Here we just do a dry run: trigger the first toggle which invokes the full sequence,
-    // then navigate to Home.
+    // Mark onboarding complete — we navigate to HomeScreen regardless of the
+    // outcome. Permissions are requested step-by-step when the user first
+    // activates effects on the HomeScreen. Any native bridge errors that
+    // surface here are non-fatal at this stage.
     try {
-      // Navigate to home first — the toggle on HomeScreen will trigger permissions
       await controller.markOnboardingDone();
-      if (!mounted) return;
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-      );
     } catch (e) {
-      setState(() {
-        _statusMessage = 'Something went wrong. Please try again.';
-        _isRequesting = false;
-      });
+      // markOnboardingDone failing to persist is non-fatal; the in-memory
+      // flag is still set and the user can proceed.
+      debugPrint('[PermissionsScreen] markOnboardingDone error (non-fatal): $e');
     }
+
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
+    );
   }
 
   @override

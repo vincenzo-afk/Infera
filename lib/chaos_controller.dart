@@ -102,30 +102,40 @@ class ChaosController extends ChangeNotifier {
   }
 
   /// Subscribes to the native EventChannel for Kotlin → Dart events.
+  /// Wrapped in try/catch so a [MissingPluginException] during the first-run
+  /// native setup doesn't propagate into unrelated async call stacks.
   void _subscribeToNativeEvents() {
-    _nativeEventSub = NativeAudioBridge.nativeEvents.listen(
-      (event) {
-        final type = event['type'] as String?;
-        switch (type) {
-          case 'onServiceStateChanged':
-            _handleServiceStateChanged(event['state'] as String? ?? 'STOPPED');
-            break;
-          case 'onAudioFocusChanged':
-            _handleFocusChanged(event['focusState'] as String? ?? 'LOST');
-            break;
-          case 'onError':
-            _handleNativeError(
-              event['code'] as String? ?? 'UNKNOWN',
-              event['message'] as String? ?? 'An error occurred.',
-            );
-            break;
-        }
-      },
-      onError: (e) {
-        debugPrint('[ChaosController] EventChannel error: $e');
-        _setError('Native event channel error.');
-      },
-    );
+    try {
+      _nativeEventSub = NativeAudioBridge.nativeEvents.listen(
+        (event) {
+          final type = event['type'] as String?;
+          switch (type) {
+            case 'onServiceStateChanged':
+              _handleServiceStateChanged(event['state'] as String? ?? 'STOPPED');
+              break;
+            case 'onAudioFocusChanged':
+              _handleFocusChanged(event['focusState'] as String? ?? 'LOST');
+              break;
+            case 'onError':
+              _handleNativeError(
+                event['code'] as String? ?? 'UNKNOWN',
+                event['message'] as String? ?? 'An error occurred.',
+              );
+              break;
+          }
+        },
+        onError: (e) {
+          debugPrint('[ChaosController] EventChannel error: $e');
+          // Do NOT call _setError here on first-run channel setup failures —
+          // the native side may not be ready until the service is started.
+        },
+        cancelOnError: false,
+      );
+    } catch (e) {
+      // MissingPluginException can be thrown synchronously if the channel
+      // is not yet registered (e.g., before MainActivity.onCreate completes).
+      debugPrint('[ChaosController] EventChannel setup error (non-fatal): $e');
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
