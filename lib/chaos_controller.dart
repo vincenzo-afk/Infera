@@ -182,7 +182,7 @@ class ChaosController extends ChangeNotifier {
   // ─────────────────────────────────────────────────────────────────────────
 
   /// Primary toggle: starts or stops Chaos Mode.
-  /// Implements the full permission sequence from ADR-004/14_PERMISSION_MODEL.md.
+  /// Implements the corrected permission sequence from ADR-004/14_PERMISSION_MODEL.md.
   Future<void> toggleChaosMode() async {
     if (isLoading) return;  // Prevent double-taps during initialisation
 
@@ -198,21 +198,31 @@ class ChaosController extends ChangeNotifier {
     _clearError();
 
     try {
-      // ── Step 1: POST_NOTIFICATIONS (Android 13+) — handled by OS on first run
-      // ── Step 2: Start foreground service in INIT state (ADR-004)
-      final serviceStarted = await NativeAudioBridge.startForegroundServiceOnly();
-      if (!serviceStarted) {
-        _setError('Notification permission is required for ChaosVoice to run in the background.');
-        _setAppState(AppState.failure);
-        return;
-      }
+      // ── Step 1: Request POST_NOTIFICATIONS (Android 13+)
+      // Handled natively — returns true immediately on pre-Android 13 devices.
+      // Does NOT block startup if denied; the FGS notification requirement will
+      // surface a clearer error downstream if POST_NOTIFICATIONS is required.
+      await NativeAudioBridge.requestNotificationPermission();
 
-      // ── Step 3: Request RECORD_AUDIO permission
+      // ── Step 2: Request RECORD_AUDIO permission
+      // Bug 4 fix: mic permission MUST be granted before starting the foreground
+      // service (step 3). On Android 14, startForeground() on a microphone-typed
+      // FGS throws SecurityException if RECORD_AUDIO is not yet granted — this was
+      // the root cause of the "crashes to home screen" bug. See ADR-004.
       final micGranted = await NativeAudioBridge.requestRecordAudioPermission();
       if (!micGranted) {
         _setError('Microphone access is needed to use ChaosVoice. Tap to grant.');
         _setAppState(AppState.failure);
-        await NativeAudioBridge.stopChaosMode();  // tear down init service
+        return;
+      }
+
+      // ── Step 3: Start foreground service in INIT state (ADR-004)
+      // RECORD_AUDIO is now guaranteed granted, so startForeground() with
+      // foregroundServiceType=microphone will succeed on Android 14.
+      final serviceStarted = await NativeAudioBridge.startForegroundServiceOnly();
+      if (!serviceStarted) {
+        _setError('Notification permission is required for ChaosVoice to run in the background.');
+        _setAppState(AppState.failure);
         return;
       }
 
@@ -256,7 +266,17 @@ class ChaosController extends ChangeNotifier {
   }
 
   /// Selects a preset — applies immediately if active, otherwise saves for next start.
+  ///
+  /// Bug 8 partial fix: on any exception during the live update, BOTH [_activePreset]
+  /// and [_liveParams] are reverted to [PresetModel.demon] to keep Dart state consistent
+  /// with what the native side will have fallen back to. The two sequential native calls
+  /// (loadPreset then updateParameter) have no atomic guarantee, so a mid-sequence
+  /// failure could leave Dart and Kotlin in different states — this revert minimises drift.
   Future<void> selectPreset(PresetModel preset) async {
+    final previousPreset = _activePreset;
+    final previousLiveParams = _liveParams;
+    final previousBoost = _boostLevel;
+
     _activePreset = preset;
     _liveParams   = preset;
     _boostLevel   = preset.boostPercent;
@@ -274,8 +294,21 @@ class ChaosController extends ChangeNotifier {
       } on PlatformException catch (e) {
         debugPrint('[ChaosController] loadPreset error: ${e.code}');
         _setError('Couldn\'t load that preset — reverted to default.');
-        _activePreset = PresetModel.demon;
-        _liveParams   = PresetModel.demon;
+        // Bug 8 fix: revert both fields so Dart state matches the native fallback.
+        _activePreset = previousPreset;
+        _liveParams   = previousLiveParams;
+        _boostLevel   = previousBoost;
+        // Restore persisted values to match the revert
+        await prefs.setString('active_preset_id', previousPreset.id);
+        await prefs.setDouble('boost_level', previousBoost);
+      } catch (e) {
+        debugPrint('[ChaosController] loadPreset unexpected error: $e');
+        _setError('Couldn\'t load that preset — reverted to default.');
+        _activePreset = previousPreset;
+        _liveParams   = previousLiveParams;
+        _boostLevel   = previousBoost;
+        await prefs.setString('active_preset_id', previousPreset.id);
+        await prefs.setDouble('boost_level', previousBoost);
       }
     }
 
@@ -433,14 +466,17 @@ class ChaosController extends ChangeNotifier {
   /// Maps error codes (16_METHOD_CHANNEL_PROTOCOL.md) to user-facing strings (25_ERROR_HANDLING.md).
   String _friendlyError(String code, String? raw) {
     return switch (code) {
-      'PERMISSION_DENIED'  => 'Microphone access is needed to use ChaosVoice. Tap to grant.',
-      'AUDIO_INIT_FAILED'  => 'Couldn\'t access the microphone. Try restarting the app.',
-      'FOCUS_DENIED'       => 'Another app is using audio right now.',
-      'PRESET_NOT_FOUND'   => 'Couldn\'t load that preset — reverted to default.',
-      'SERVICE_NOT_RUNNING'=> 'ChaosVoice is not currently active.',
-      'SERVICE_START_FAILED'
-                           => 'Notification permission is required for ChaosVoice to run in the background.',
-      _                    => raw ?? 'An unexpected error occurred. Please restart the app.',
+      'PERMISSION_DENIED'    => 'Microphone access is needed to use ChaosVoice. Tap to grant.',
+      'AUDIO_INIT_FAILED'    => 'Couldn\'t access the microphone. Try restarting the app.',
+      'FOCUS_DENIED'         => 'Another app is using audio right now.',
+      'PRESET_NOT_FOUND'     => 'Couldn\'t load that preset — reverted to default.',
+      'SERVICE_NOT_RUNNING'  => 'ChaosVoice is not currently active.',
+      'SERVICE_START_FAILED' => 'Notification permission is required for ChaosVoice to run in the background.',
+      // Bug 1/2 fix: FGS_START_FAILED is broadcast from transitionToInit() when
+      // startForeground() throws (e.g., mic permission not granted, OEM restriction).
+      'FGS_START_FAILED'     => 'ChaosVoice couldn\'t start the background service. '
+                                'Ensure microphone permission is granted and try again.',
+      _                      => raw ?? 'An unexpected error occurred. Please restart the app.',
     };
   }
 

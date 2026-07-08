@@ -25,8 +25,20 @@ class NativeAudioBridge {
 
   // ── MethodChannel calls ────────────────────────────────────────────────────
 
+  /// Requests [POST_NOTIFICATIONS] permission from the OS (Android 13+).
+  /// Step 1 of the corrected permission sequence (ADR-004).
+  ///
+  /// Returns `true` if granted or if the OS version is below Android 13
+  /// (where notification permission is automatically granted).
+  static Future<bool> requestNotificationPermission() async {
+    final result =
+        await _channel.invokeMethod<bool>('requestNotificationPermission');
+    return result ?? false;
+  }
+
   /// Starts the foreground service in INIT state (no audio yet).
-  /// Step 2 of the permission sequence (ADR-004).
+  /// Step 3 of the corrected permission sequence (ADR-004).
+  /// RECORD_AUDIO must already be granted before calling this.
   ///
   /// Throws [PlatformException] with code "SERVICE_START_FAILED" on failure.
   static Future<bool> startForegroundServiceOnly() async {
@@ -36,7 +48,8 @@ class NativeAudioBridge {
   }
 
   /// Requests [RECORD_AUDIO] permission from the OS.
-  /// Step 3 of the permission sequence.
+  /// Step 2 of the corrected permission sequence (ADR-004).
+  /// Must be requested BEFORE [startForegroundServiceOnly] on Android 14+.
   ///
   /// Returns `true` if granted.
   static Future<bool> requestRecordAudioPermission() async {

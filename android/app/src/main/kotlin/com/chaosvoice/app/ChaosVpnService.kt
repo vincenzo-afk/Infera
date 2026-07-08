@@ -74,8 +74,17 @@ class ChaosVpnService : VpnService() {
      *
      * Address: 127.0.0.2/32 — loopback-range, never globally routable.
      * allowBypass(): all apps route traffic normally; nothing is tunnelled.
-     * No addRoute() calls: kernel receives no routing entries for this interface.
-     * See class-level doc for full network-safety reasoning.
+     * No addRoute() calls — kernel receives no routing entries for this interface,
+     * consistent with the class-level "zero traffic tunnelled" guarantee.
+     *
+     * Bug 6 fix: removed addRoute("192.0.2.1", 32) which was inconsistent with
+     * allowBypass() and the class-level documentation. allowBypass() alone is
+     * sufficient for the OS to maintain the interface as a live anchor.
+     *
+     * ⚠ MANUAL REGRESSION REQUIRED: verify that the survival service still
+     * prevents aggressive background kill on MIUI/OneUI target devices after
+     * this route removal. If background survival regresses, see KNOWN_ISSUES.md
+     * and consider replacing the route with a keep-alive mechanism instead.
      */
     fun establish() {
         if (isEstablished) {
@@ -87,10 +96,8 @@ class ChaosVpnService : VpnService() {
                 .setSession("ChaosVoice Survival")
                 // Loopback-range address — not globally routable
                 .addAddress("127.0.0.2", 32)
-                // Bug fix: add a route to a dummy IP (TEST-NET-1 documentation range) so the OS
-                // sees the VPN as active and doesn't discard it as empty, while keeping normal routing safe.
-                .addRoute("192.0.2.1", 32)
-                // All apps bypass this VPN by default; no traffic is ever tunnelled
+                // All apps bypass this VPN by default; no traffic is ever tunnelled.
+                // allowBypass() alone keeps the interface alive as a process-lifecycle anchor.
                 .allowBypass()
                 .establish()
             isEstablished = vpnInterface != null

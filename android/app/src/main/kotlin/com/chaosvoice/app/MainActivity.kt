@@ -42,8 +42,14 @@ class MainActivity : FlutterActivity() {
         // Static EventSink — set when Flutter subscribes to the EventChannel.
         // Used by ChaosProjectionService to push events back to Dart.
         @Volatile private var eventSink: EventChannel.EventSink? = null
+
+        // Pending MethodChannel results for permissions that require a callback.
+        // Bug 9 fix: each field is set to null immediately before calling success()/error()
+        // to prevent IllegalStateException("Reply already submitted") if a callback fires
+        // twice (e.g., from a stale result after a crash-and-relaunch mid-dialog).
         private var pendingResultAudio: MethodChannel.Result? = null
         private var pendingResultVpn: MethodChannel.Result? = null
+        private var pendingResultNotification: MethodChannel.Result? = null
 
         // ── Static helpers called by ChaosProjectionService ───────────────
 
@@ -108,8 +114,34 @@ class MainActivity : FlutterActivity() {
 
         when (method) {
 
+            // ── requestNotificationPermission ────────────────────────────
+            // Step 1 of the corrected permission sequence (ADR-004, 14_PERMISSION_MODEL.md).
+            // On Android 13+ (TIRAMISU), POST_NOTIFICATIONS is a runtime permission.
+            // On earlier versions it is automatically granted, so we return true immediately.
+            "requestNotificationPermission" -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
+                        == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        result.success(true)
+                        Log.i("[ChaosVoice][PERMS]", "POST_NOTIFICATIONS already granted")
+                    } else {
+                        pendingResultNotification = result
+                        ActivityCompat.requestPermissions(
+                            this,
+                            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                            REQ_POST_NOTIF
+                        )
+                    }
+                } else {
+                    // Pre-Android 13: notification permission is automatically granted.
+                    result.success(true)
+                }
+            }
+
             // ── startForegroundServiceOnly ───────────────────────────────
-            // Start service in INIT state (no audio) — step 2 of permission sequence (ADR-004)
+            // Start service in INIT state (no audio) — step 3 of corrected permission
+            // sequence (ADR-004). RECORD_AUDIO must already be granted before this point.
             "startForegroundServiceOnly" -> {
                 try {
                     startChaosService(ChaosProjectionService.STATE_INIT)
@@ -122,7 +154,10 @@ class MainActivity : FlutterActivity() {
             }
 
             // ── requestRecordAudioPermission ─────────────────────────────
-            // Step 3 of permission sequence (ADR-004, 14_PERMISSION_MODEL.md)
+            // Step 2 of the corrected permission sequence (ADR-004, 14_PERMISSION_MODEL.md).
+            // Must be requested BEFORE startForegroundServiceOnly on Android 14+ so that
+            // RECORD_AUDIO is granted at the moment startForeground() is called on a
+            // microphone-typed foreground service.
             "requestRecordAudioPermission" -> {
                 if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
                     == PackageManager.PERMISSION_GRANTED
@@ -140,15 +175,24 @@ class MainActivity : FlutterActivity() {
             }
 
             // ── startChaosMode ───────────────────────────────────────────
-            // Step 5: transition service to ACTIVE, begin audio processing
+            // Bug 3 fix: send START_CHAOS_MODE broadcast to the already-running service
+            // instead of calling startForegroundService(STATE_ACTIVE), which would trigger
+            // a redundant mic-type permission check on some OEM ROMs. The service registers
+            // the START_CHAOS_MODE action in its commandReceiver during onCreate(), so the
+            // broadcast is guaranteed to be received once the INIT transition completes.
             "startChaosMode" -> {
-                val preset    = args["preset"] as? String ?: Preset.DEMON.id
+                val preset     = args["preset"] as? String ?: Preset.DEMON.id
                 val boostLevel = (args["boostLevel"] as? Number)?.toFloat() ?: 150f
                 try {
-                    startChaosService(ChaosProjectionService.STATE_ACTIVE, preset, boostLevel)
+                    val broadcastIntent = Intent("com.chaosvoice.app.START_CHAOS_MODE").apply {
+                        `package` = packageName
+                        putExtra(ChaosProjectionService.EXTRA_PRESET, preset)
+                        putExtra(ChaosProjectionService.EXTRA_BOOST, boostLevel)
+                    }
+                    sendBroadcast(broadcastIntent)
                     result.success(true)
                 } catch (e: Exception) {
-                    Log.e(TAG, "startChaosMode failed: ${e.message}")
+                    Log.e(TAG, "startChaosMode broadcast failed: ${e.message}")
                     result.error("AUDIO_INIT_FAILED", e.message, null)
                 }
             }
@@ -294,8 +338,21 @@ class MainActivity : FlutterActivity() {
                 val granted = grantResults.isNotEmpty() &&
                               grantResults[0] == PackageManager.PERMISSION_GRANTED
                 Log.i("[ChaosVoice][PERMS]", "RECORD_AUDIO granted=$granted")
-                pendingResultAudio?.success(granted)
+                // Bug 9 fix: capture and null-out the pending result before calling success()
+                // to prevent IllegalStateException("Reply already submitted") if this callback
+                // fires a second time (e.g., process relaunch after FGS crash mid-dialog).
+                val pending = pendingResultAudio
                 pendingResultAudio = null
+                pending?.success(granted)
+            }
+            REQ_POST_NOTIF -> {
+                val granted = grantResults.isNotEmpty() &&
+                              grantResults[0] == PackageManager.PERMISSION_GRANTED
+                Log.i("[ChaosVoice][PERMS]", "POST_NOTIFICATIONS granted=$granted")
+                // Bug 9 fix: same null-before-dispatch pattern.
+                val pending = pendingResultNotification
+                pendingResultNotification = null
+                pending?.success(granted)
             }
         }
     }
@@ -306,8 +363,10 @@ class MainActivity : FlutterActivity() {
             REQ_VPN_PERMISSION -> {
                 val granted = resultCode == Activity.RESULT_OK
                 Log.i("[ChaosVoice][PERMS]", "VPN permission granted=$granted")
-                pendingResultVpn?.success(granted)
+                // Bug 9 fix: capture and null-out before dispatch.
+                val pending = pendingResultVpn
                 pendingResultVpn = null
+                pending?.success(granted)
             }
         }
     }

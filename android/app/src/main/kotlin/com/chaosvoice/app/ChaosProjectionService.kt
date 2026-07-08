@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -89,15 +90,25 @@ class ChaosProjectionService : Service() {
 
     private val commandReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val action = intent.action
-            if (action == "com.chaosvoice.app.UPDATE_PARAMETER") {
-                val stageKey = intent.getStringExtra("stage") ?: return
-                val value    = intent.getFloatExtra("value", 0f)
-                val stage    = ChaosDSP.Stage.fromKey(stageKey)
-                if (stage != null) dsp.setParameter(stage, value)
-            } else if (action == "com.chaosvoice.app.LOAD_PRESET") {
-                val pid = intent.getStringExtra("presetId") ?: return
-                dsp.loadPreset(Preset.builtInById(pid))
+            when (intent.action) {
+                "com.chaosvoice.app.UPDATE_PARAMETER" -> {
+                    val stageKey = intent.getStringExtra("stage") ?: return
+                    val value    = intent.getFloatExtra("value", 0f)
+                    val stage    = ChaosDSP.Stage.fromKey(stageKey)
+                    if (stage != null) dsp.setParameter(stage, value)
+                }
+                "com.chaosvoice.app.LOAD_PRESET" -> {
+                    val pid = intent.getStringExtra("presetId") ?: return
+                    dsp.loadPreset(Preset.builtInById(pid))
+                }
+                // Bug 3 fix: ACTIVE transition arrives here (service already in foreground from INIT),
+                // avoiding a second startForegroundService() call that re-triggers the mic-type
+                // permission check on OEM ROMs (MainActivity.startChaosMode now uses sendBroadcast).
+                "com.chaosvoice.app.START_CHAOS_MODE" -> {
+                    val presetId = intent.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
+                    val boost    = intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
+                    transitionToActive(presetId, boost)
+                }
             }
         }
     }
@@ -107,10 +118,13 @@ class ChaosProjectionService : Service() {
         createNotificationChannel()
         focusManager = AudioFocusManager(this) { focusChange -> onFocusChanged(focusChange) }
         
-        // Register local command receiver to avoid startService background restrictions
+        // Register local command receiver to avoid startService background restrictions.
+        // Bug 3 fix: START_CHAOS_MODE is added so MainActivity can trigger the ACTIVE
+        // transition via broadcast instead of a second startForegroundService() call.
         val filter = android.content.IntentFilter().apply {
             addAction("com.chaosvoice.app.UPDATE_PARAMETER")
             addAction("com.chaosvoice.app.LOAD_PRESET")
+            addAction("com.chaosvoice.app.START_CHAOS_MODE")
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(commandReceiver, filter, RECEIVER_NOT_EXPORTED)
@@ -123,16 +137,22 @@ class ChaosProjectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val targetState = intent?.getStringExtra(EXTRA_TARGET_STATE) ?: STATE_INIT
 
-        // Bug fix: if targetState is STOPPED, we must call startForeground immediately
-        // to satisfy startForegroundService() OS contract, then shut down to avoid crashes.
+        // If targetState is STOPPED, satisfy the startForegroundService() OS contract
+        // by calling startForeground() immediately before shutting down.
+        // Bug 2 fix: wrapped in try-catch so any FGS-type violation or OEM restriction
+        // fails down cleanly instead of crashing the process (25_ERROR_HANDLING.md).
         if (targetState == STATE_STOPPED) {
-            startForeground(NOTIFICATION_ID, buildNotification("Stopping ChaosVoice…"))
+            try {
+                startForegroundCompat(buildNotification("Stopping ChaosVoice…"))
+            } catch (e: Exception) {
+                Log.w(TAG, "startForeground on STOPPED path threw (ignored): ${e.message}")
+            }
             cleanupAndStop()
             return START_NOT_STICKY
         }
 
         val presetId = intent?.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
-        
+
         // Bug fix: getFloatExtra returns primitive, so safe-check intent instead of unreachable ?: fallback
         val boost = if (intent != null) {
             intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
@@ -142,9 +162,13 @@ class ChaosProjectionService : Service() {
 
         Log.i(TAG, "onStartCommand targetState=$targetState presetId=$presetId boost=$boost")
 
+        // Bug 3 fix: only INIT arrives via onStartCommand now.
+        // ACTIVE transition is sent via START_CHAOS_MODE broadcast (see commandReceiver)
+        // so we never call startForegroundService() a second time on an already-running service.
         when (targetState) {
-            STATE_INIT    -> transitionToInit()
-            STATE_ACTIVE  -> transitionToActive(presetId, boost)
+            STATE_INIT -> transitionToInit()
+            // STATE_ACTIVE path is dead from MainActivity, kept only for legacy deep-links / tests.
+            STATE_ACTIVE -> transitionToActive(presetId, boost)
         }
 
         return START_STICKY
@@ -155,12 +179,52 @@ class ChaosProjectionService : Service() {
     // State transitions
     // ─────────────────────────────────────────────────────────────────────────
 
-    /** INIT: show notification, no audio yet — used while permissions are being granted (ADR-004). */
+    /**
+     * INIT: show foreground notification, no audio yet — used while permissions are being granted.
+     *
+     * Bug 1 fix: on API 34, startForeground() on a foreground service typed 'microphone'
+     * throws SecurityException if RECORD_AUDIO is not already granted at this moment.
+     * The Dart sequence now requests RECORD_AUDIO *before* calling startForegroundServiceOnly(),
+     * so RECORD_AUDIO is guaranteed granted here. See ADR-004 and 14_PERMISSION_MODEL.md.
+     *
+     * Bug 2 fix: startForeground() is wrapped in try-catch. On any throw (OEM restriction,
+     * FGS-type violation, etc.) we broadcast FGS_START_FAILED and call cleanupAndStop()
+     * instead of letting the exception propagate and kill the process (25_ERROR_HANDLING.md).
+     */
     private fun transitionToInit() {
         serviceState = ServiceState.INIT
-        startForeground(NOTIFICATION_ID, buildNotification("ChaosVoice — ready"))
+        try {
+            startForegroundCompat(buildNotification("ChaosVoice — ready"))
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground in INIT failed: ${e.message}", e)
+            broadcastError("FGS_START_FAILED",
+                "ChaosVoice couldn't start the background service. " +
+                "Please ensure microphone permission is granted and try again.")
+            cleanupAndStop()
+            return
+        }
         broadcastStateChange(STATE_INIT)
         Log.i(TAG, "→ INIT state")
+    }
+
+    /**
+     * Calls the correct [startForeground] overload for the current API level.
+     *
+     * On API 29+ (Android 10+), the overload that accepts [ServiceInfo] service type flags
+     * must be used for microphone-typed foreground services. Both the manifest
+     * `foregroundServiceType="microphone"` attribute AND this runtime flag are required —
+     * they are independent enforcement points.
+     */
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
     /**

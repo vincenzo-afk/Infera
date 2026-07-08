@@ -54,6 +54,12 @@ class ChaosDSP(private val sampleRate: Int = SAMPLE_RATE) {
         const val ECHO_PREWARM_MS          = 500          // Known Issue #4 fix
         const val BURST_DUR_MIN_MS         = 50
         const val BURST_DUR_MAX_MS         = 150
+
+        // Bug 7 fix: IIR-style delay smoothing coefficient (1-pole smoother).
+        // At 0.002f convergence per sample, a 500 ms parameter step (24 000 samples
+        // at 48 kHz) converges within ~10 ms — fast enough to feel immediate,
+        // slow enough to produce zero audible click.
+        private const val DELAY_SMOOTH_RATE = 0.002f
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -123,6 +129,13 @@ class ChaosDSP(private val sampleRate: Int = SAMPLE_RATE) {
     private val maxDelaySamples = sampleRate * 2   // 2-second ring buffer max
     private val delayBuf        = FloatArray(maxDelaySamples)
     private var delayWriteIdx   = 0
+    // Bug 7 fix: track delay length as a Float and ramp it smoothly towards the
+    // target value at DELAY_SMOOTH_RATE per sample. An instant jump in delaySamples
+    // causes the read head to skip, producing a transient click when the slider moves.
+    // At 0.002 samples/sample convergence, a max change of 500 ms (24000 samples) takes
+    // ~24000 / (24000 * 0.002) = 500 ms worst-case, but typical slider moves are small
+    // (<1000 sample delta) and converge in under 10 ms — imperceptible.
+    private var currentDelaySamples = -1f   // -1 sentinel: snap on first process() call
 
     // ── Stage 6: Ring mod phase accumulator ─────────────────────────────────
     private var ringModPhase = 0.0
@@ -309,14 +322,31 @@ class ChaosDSP(private val sampleRate: Int = SAMPLE_RATE) {
         // STAGE 4 — Feedback Delay
         // delayed = ringBuffer[readIndex]
         // output[n] = input[n] + feedback · delayed
-        // ringBuffer[writeIndex] = input[n] + feedback · delayed  (self-feedback)
+        // ringBuffer[writeIndex] = output[n]  (self-feedback)
+        //
+        // Bug 7 fix: delaySamples is smoothed per-sample toward the target value
+        // (1-pole IIR at DELAY_SMOOTH_RATE) so live slider changes produce no click.
+        // Linear interpolation between adjacent ring-buffer slots handles the fractional
+        // read position, preventing stale/garbage reads when delay changes mid-buffer.
         // ════════════════════════════════════════════════════════════════════
-        val delaySamples = (sDelayMs * sampleRate / 1000f).toInt().coerceIn(1, maxDelaySamples - 1)
+        val targetDelaySamples = (sDelayMs * sampleRate / 1000f).coerceIn(1f, (maxDelaySamples - 1).toFloat())
+        // Snap to target on the very first process() call (sentinel -1f) to avoid
+        // an invalid ramp from 0 at session start.
+        if (currentDelaySamples < 0f) currentDelaySamples = targetDelaySamples
+
         for (i in 0 until len) {
-            val readIdx = ((delayWriteIdx - delaySamples) + maxDelaySamples) % maxDelaySamples
-            val delayed = delayBuf[readIdx]
+            // Smooth: advance currentDelaySamples toward target by DELAY_SMOOTH_RATE each sample.
+            currentDelaySamples += (targetDelaySamples - currentDelaySamples) * DELAY_SMOOTH_RATE
+
+            // Fractional read position in the ring buffer.
+            val readPosF  = (delayWriteIdx - currentDelaySamples + maxDelaySamples) % maxDelaySamples
+            val readIdx0  = readPosF.toInt() % maxDelaySamples
+            val readIdx1  = (readIdx0 + 1) % maxDelaySamples
+            val frac      = readPosF - readIdx0
+            // Linear interpolation between the two adjacent ring-buffer samples.
+            val delayed   = delayBuf[readIdx0] + frac * (delayBuf[readIdx1] - delayBuf[readIdx0])
+
             val out = workBuf[i] + sDelayFb * delayed
-            // Reuse 'out' — no need to recompute the same expression for the ring buffer write
             delayBuf[delayWriteIdx] = out.coerceIn(-1f, 1f)
             delayWriteIdx = (delayWriteIdx + 1) % maxDelaySamples
             workBuf[i] = out
@@ -560,6 +590,7 @@ class ChaosDSP(private val sampleRate: Int = SAMPLE_RATE) {
         bqX1 = 0.0; bqX2 = 0.0; bqY1 = 0.0; bqY2 = 0.0
         delayBuf.fill(0f)
         delayWriteIdx = 0
+        currentDelaySamples = -1f  // sentinel: snap to target on next process() call
         ringModPhase = 0.0
         wobblePhase = 0.0; pitchReadPos = 0.0
         for (b in 0 until NUM_VBANDS) {

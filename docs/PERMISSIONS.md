@@ -37,11 +37,21 @@
 ## 3. Correct Request Order
 
 1. `POST_NOTIFICATIONS` (Android 13+)
-2. Start `ChaosProjectionService` in `INIT` state (foreground-only, no processing yet)
-3. Request battery optimization exemption
-4. Transition service to `ACTIVE` state and begin audio processing
+2. Request `RECORD_AUDIO` runtime permission
+3. Start `ChaosProjectionService` in `INIT` state (foreground-only, no processing yet)
+4. Request battery optimization exemption
+5. Transition service to `ACTIVE` state and begin audio processing
 
-This order matters because Android 14 requires an active foreground service before certain permission dialogs will behave correctly, and requesting battery exemption after the service is already running is more reliable than requesting it upfront.
+**Why RECORD_AUDIO before the service (Android 14 requirement):**
+On API 34 (targetSdk), Android enforces that `RECORD_AUDIO` must already be **granted** at
+the moment `startForeground()` is called on a service declared with
+`foregroundServiceType="microphone"`. Starting the service first and requesting mic permission
+afterwards (the previous order) throws a `SecurityException` /
+`MissingForegroundServiceTypeException` inside `Service.onStartCommand()` — a call stack
+that nothing in `MainActivity` catches, killing the entire process. This was the root cause
+of the "crashes to home screen" bug on START CHAOS tap. The guidance that Android 14 requires
+an active foreground service *before* permission dialogs behave correctly is accurate for
+notification and other permission types, but does **not** apply to microphone-typed FGS.
 
 ## 4. Runtime Permission Handling
 
