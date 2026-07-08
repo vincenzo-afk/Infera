@@ -60,12 +60,12 @@ class NativeAudioBridge {
 
   /// Transitions the service to ACTIVE — begins full capture → DSP → playback.
   ///
-  /// @param preset  Built-in or custom preset ID
+  /// @param preset  Built-in preset ID (String) or serialized Preset Map (Map)
   /// @param boostLevel  Gain percentage 100–500
   ///
   /// Throws [PlatformException] with codes:
   ///   "PERMISSION_DENIED", "AUDIO_INIT_FAILED", "FOCUS_DENIED"
-  static Future<bool> startChaosMode(String preset, double boostLevel) async {
+  static Future<bool> startChaosMode(dynamic preset, double boostLevel) async {
     final result = await _channel.invokeMethod<bool>('startChaosMode', {
       'preset': preset,
       'boostLevel': boostLevel,
@@ -93,12 +93,12 @@ class NativeAudioBridge {
     return result ?? false;
   }
 
-  /// Loads a complete preset by ID on the native side.
+  /// Loads a complete preset by ID or Map on the native side.
   ///
   /// Throws [PlatformException] with code "PRESET_NOT_FOUND" for unknown IDs.
-  static Future<bool> loadPreset(String presetId) async {
+  static Future<bool> loadPreset(dynamic preset) async {
     final result = await _channel.invokeMethod<bool>('loadPreset', {
-      'presetId': presetId,
+      'preset': preset,
     });
     return result ?? false;
   }

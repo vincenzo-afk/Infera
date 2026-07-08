@@ -176,17 +176,22 @@ class MainActivity : FlutterActivity() {
 
             // ── startChaosMode ───────────────────────────────────────────
             // Bug 3 fix: send START_CHAOS_MODE broadcast to the already-running service
-            // instead of calling startForegroundService(STATE_ACTIVE), which would trigger
-            // a redundant mic-type permission check on some OEM ROMs. The service registers
-            // the START_CHAOS_MODE action in its commandReceiver during onCreate(), so the
-            // broadcast is guaranteed to be received once the INIT transition completes.
+            // instead of calling startForegroundService(STATE_ACTIVE).
             "startChaosMode" -> {
-                val preset     = args["preset"] as? String ?: Preset.DEMON.id
+                val presetObj  = args["preset"]
                 val boostLevel = (args["boostLevel"] as? Number)?.toFloat() ?: 150f
                 try {
                     val broadcastIntent = Intent("com.chaosvoice.app.START_CHAOS_MODE").apply {
                         `package` = packageName
-                        putExtra(ChaosProjectionService.EXTRA_PRESET, preset)
+                        if (presetObj is Map<*, *>) {
+                            @Suppress("UNCHECKED_CAST")
+                            val presetMap = presetObj as Map<String, Any>
+                            putExtra("presetJson", org.json.JSONObject(presetMap).toString())
+                        } else if (presetObj is String) {
+                            putExtra(ChaosProjectionService.EXTRA_PRESET, presetObj)
+                        } else {
+                            putExtra(ChaosProjectionService.EXTRA_PRESET, Preset.DEMON.id)
+                        }
                         putExtra(ChaosProjectionService.EXTRA_BOOST, boostLevel)
                     }
                     sendBroadcast(broadcastIntent)
@@ -211,10 +216,6 @@ class MainActivity : FlutterActivity() {
 
             // ── updateParameter ──────────────────────────────────────────
             // Live DSP parameter update from a slider change.
-            // Bug fix: the previous version called startChaosService(STATE_ACTIVE) here
-            // as a supposed "no-op", but that re-triggered transitionToActive() on every
-            // slider move — tearing down and re-initialising AudioRecord/AudioTrack
-            // and reloading the Demon preset every time. Removed entirely.
             "updateParameter" -> {
                 val stageKey = args["stage"] as? String ?: ""
                 val value    = (args["value"] as? Number)?.toFloat() ?: 0f
@@ -229,13 +230,25 @@ class MainActivity : FlutterActivity() {
 
             // ── loadPreset ───────────────────────────────────────────────
             "loadPreset" -> {
-                val presetId = args["presetId"] as? String ?: ""
-                val preset = Preset.ALL_BUILT_IN.find { it.id == presetId }
-                if (preset == null) {
-                    result.error("PRESET_NOT_FOUND", "Preset '$presetId' not found", null)
-                } else {
-                    sendPresetLoad(presetId)
+                val presetObj = args["preset"]
+                val presetId = args["presetId"] as? String
+                try {
+                    val broadcastIntent = Intent("com.chaosvoice.app.LOAD_PRESET").apply {
+                        `package` = packageName
+                        if (presetObj is Map<*, *>) {
+                            @Suppress("UNCHECKED_CAST")
+                            val presetMap = presetObj as Map<String, Any>
+                            putExtra("presetJson", org.json.JSONObject(presetMap).toString())
+                        } else if (presetObj is String) {
+                            putExtra("presetId", presetObj)
+                        } else if (presetId != null) {
+                            putExtra("presetId", presetId)
+                        }
+                    }
+                    sendBroadcast(broadcastIntent)
                     result.success(true)
+                } catch (e: Exception) {
+                    result.error("PRESET_NOT_FOUND", e.message, null)
                 }
             }
 
@@ -267,8 +280,11 @@ class MainActivity : FlutterActivity() {
             // ── startVpnSurvivalService ───────────────────────────────────
             "startVpnSurvivalService" -> {
                 try {
+                    val prefs = getSharedPreferences("chaosvoice_prefs", Context.MODE_PRIVATE)
+                    prefs.edit().putBoolean("vpn_survival_enabled", true).apply()
+
                     val intent = Intent(this, ChaosVpnService::class.java)
-                    startService(intent)
+                    ContextCompat.startForegroundService(this, intent)
                     result.success(true)
                 } catch (e: Exception) {
                     result.error("SERVICE_START_FAILED", e.message, null)
@@ -277,8 +293,15 @@ class MainActivity : FlutterActivity() {
 
             // ── stopVpnSurvivalService ───────────────────────────────────
             "stopVpnSurvivalService" -> {
-                stopService(Intent(this, ChaosVpnService::class.java))
-                result.success(true)
+                try {
+                    val prefs = getSharedPreferences("chaosvoice_prefs", Context.MODE_PRIVATE)
+                    prefs.edit().putBoolean("vpn_survival_enabled", false).apply()
+
+                    stopService(Intent(this, ChaosVpnService::class.java))
+                    result.success(true)
+                } catch (e: Exception) {
+                    result.error("SERVICE_STOP_FAILED", e.message, null)
+                }
             }
 
             else -> result.notImplemented()

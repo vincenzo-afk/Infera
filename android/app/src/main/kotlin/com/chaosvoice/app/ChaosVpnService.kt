@@ -3,6 +3,7 @@ package com.chaosvoice.app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -57,7 +58,11 @@ class ChaosVpnService : VpnService() {
     override fun onStartCommand(intent: android.content.Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "ChaosVpnService onStartCommand (isEstablished=$isEstablished)")
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
 
         // Guard: do not call establish() again if this instance already has a live FD
         if (!isEstablished) {

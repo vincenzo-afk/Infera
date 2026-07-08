@@ -22,6 +22,8 @@
 
     <!-- Android 14+ requirement for mic-using foreground services -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Android 14+ requirement for system-exempted foreground services like VPN survival -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
 
     <!-- ── Notification permission (Android 13+) ─────────────────────── -->
     <!-- Requested at runtime as first step in permission sequence (ADR-004) -->
@@ -97,7 +99,8 @@
             android:name=".ChaosVpnService"
             android:enabled="true"
             android:exported="true"
-            android:permission="android.permission.BIND_VPN_SERVICE">
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="systemExempted">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

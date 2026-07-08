@@ -208,7 +208,7 @@ class ChaosDSP(private val sampleRate: Int = SAMPLE_RATE) {
      */
     private fun recomputeBiquadCoeffs() {
         val f0 = pEqFrequency.get().toDouble()
-        val q  = pEqQ.get().toDouble()
+        val q  = pEqQ.get().toDouble().coerceAtLeast(0.1)
         lastEqFreq = pEqFrequency.get()
         lastEqQ    = pEqQ.get()
 

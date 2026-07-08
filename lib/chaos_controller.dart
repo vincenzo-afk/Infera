@@ -34,9 +34,7 @@ class ChaosController extends ChangeNotifier {
   PresetModel get liveParams => _liveParams;
 
   // ── Volume boost ─────────────────────────────────────────────────────────
-  // Default 150% per 22_CONFIGURATION.md
-  double _boostLevel = 150;
-  double get boostLevel => _boostLevel;
+  double get boostLevel => _liveParams.boostPercent;
 
   // ── Limiter (settings, 21_SETTINGS_AND_PRESETS.md) ───────────────────────
   bool _limiterEnabled = true;
@@ -80,15 +78,10 @@ class ChaosController extends ChangeNotifier {
   Future<void> _loadPersistedSettings() async {
     final prefs = await SharedPreferences.getInstance();
     _onboardingDone = prefs.getBool('onboarding_done') ?? false;
-    _boostLevel     = prefs.getDouble('boost_level')   ?? 150;
     _limiterEnabled = prefs.getBool('limiter_enabled') ?? true;
     _vpnSurvivalEnabled = prefs.getBool('vpn_survival_enabled') ?? false;
 
-    final lastPresetId = prefs.getString('active_preset_id') ?? 'demon';
-    _activePreset = PresetModel.builtInById(lastPresetId);
-    _liveParams   = _activePreset;
-
-    // Load custom presets from JSON storage
+    // Load custom presets from JSON storage first to resolve custom active presets
     final rawCustom = prefs.getStringList('custom_presets') ?? [];
     _customPresets = rawCustom.map((s) {
       try {
@@ -97,6 +90,12 @@ class ChaosController extends ChangeNotifier {
         return null;
       }
     }).whereType<PresetModel>().toList();
+
+    final lastPresetId = prefs.getString('active_preset_id') ?? 'demon';
+    _activePreset = allPresets.firstWhere((p) => p.id == lastPresetId, orElse: () => PresetModel.demon);
+    
+    final savedBoost = prefs.getDouble('boost_level') ?? _activePreset.boostPercent;
+    _liveParams   = _activePreset.copyWith(boostPercent: savedBoost);
 
     notifyListeners();
   }
@@ -231,8 +230,8 @@ class ChaosController extends ChangeNotifier {
 
       // ── Step 5: Transition to ACTIVE
       final started = await NativeAudioBridge.startChaosMode(
-        _activePreset.id,
-        _boostLevel,
+        _activePreset.isBuiltIn ? _activePreset.id : _activePreset.toJson(),
+        boostLevel,
       );
       if (!started) {
         _setError('Failed to start ChaosVoice. Please try again.');
@@ -275,41 +274,38 @@ class ChaosController extends ChangeNotifier {
   Future<void> selectPreset(PresetModel preset) async {
     final previousPreset = _activePreset;
     final previousLiveParams = _liveParams;
-    final previousBoost = _boostLevel;
 
     _activePreset = preset;
     _liveParams   = preset;
-    _boostLevel   = preset.boostPercent;
 
     // Persist last selection
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('active_preset_id', preset.id);
-    await prefs.setDouble('boost_level', _boostLevel);
+    await prefs.setDouble('boost_level', preset.boostPercent);
 
     if (isActive) {
       try {
-        await NativeAudioBridge.loadPreset(preset.id);
+        await NativeAudioBridge.loadPreset(preset.isBuiltIn ? preset.id : preset.toJson());
         // Also update boost since presets have their own default boost
-        await NativeAudioBridge.updateParameter('boostPercent', _boostLevel);
+        await NativeAudioBridge.updateParameter('boostPercent', preset.boostPercent);
       } on PlatformException catch (e) {
         debugPrint('[ChaosController] loadPreset error: ${e.code}');
         _setError('Couldn\'t load that preset — reverted to default.');
-        // Bug 8 fix: revert both fields so Dart state matches the native fallback.
         _activePreset = previousPreset;
         _liveParams   = previousLiveParams;
-        _boostLevel   = previousBoost;
         // Restore persisted values to match the revert
         await prefs.setString('active_preset_id', previousPreset.id);
-        await prefs.setDouble('boost_level', previousBoost);
+        await prefs.setDouble('boost_level', previousLiveParams.boostPercent);
       } catch (e) {
         debugPrint('[ChaosController] loadPreset unexpected error: $e');
         _setError('Couldn\'t load that preset — reverted to default.');
         _activePreset = previousPreset;
         _liveParams   = previousLiveParams;
-        _boostLevel   = previousBoost;
         await prefs.setString('active_preset_id', previousPreset.id);
-        await prefs.setDouble('boost_level', previousBoost);
+        await prefs.setDouble('boost_level', previousLiveParams.boostPercent);
       }
+    } else {
+      _setError('Effects will apply once you activate Chaos Mode.');
     }
 
     notifyListeners();
@@ -318,7 +314,6 @@ class ChaosController extends ChangeNotifier {
   /// Sets the output boost level and forwards to native if active.
   Future<void> setBoost(double value) async {
     final clamped = value.clamp(100.0, 500.0);
-    _boostLevel = clamped;
     _liveParams = _liveParams.copyWith(boostPercent: clamped);
 
     final prefs = await SharedPreferences.getInstance();
@@ -326,6 +321,8 @@ class ChaosController extends ChangeNotifier {
 
     if (isActive) {
       await NativeAudioBridge.updateParameter('boostPercent', clamped);
+    } else {
+      _setError('Effects will apply once you activate Chaos Mode.');
     }
     notifyListeners();
   }
@@ -335,9 +332,7 @@ class ChaosController extends ChangeNotifier {
     // Update live params in state (for UI reflection)
     _liveParams = _applyParam(_liveParams, stageKey, value);
     
-    // Bug fix: keep the quick boost level (Home Screen) and advanced parameter boost level in sync
     if (stageKey == 'boostPercent') {
-      _boostLevel = value;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble('boost_level', value);
     }
@@ -348,6 +343,8 @@ class ChaosController extends ChangeNotifier {
       } on PlatformException catch (e) {
         debugPrint('[ChaosController] updateParameter error: ${e.code}');
       }
+    } else {
+      _setError('Effects will apply once you activate Chaos Mode.');
     }
     notifyListeners();
   }
@@ -386,11 +383,12 @@ class ChaosController extends ChangeNotifier {
   /// Resets [_liveParams] back to the active preset defaults.
   void resetToPresetDefaults() {
     _liveParams = _activePreset;
-    _boostLevel = _activePreset.boostPercent;
     notifyListeners();
     // If active, reload preset on native side
     if (isActive) {
-      NativeAudioBridge.loadPreset(_activePreset.id);
+      NativeAudioBridge.loadPreset(_activePreset.isBuiltIn ? _activePreset.id : _activePreset.toJson());
+    } else {
+      _setError('Effects will apply once you activate Chaos Mode.');
     }
   }
 

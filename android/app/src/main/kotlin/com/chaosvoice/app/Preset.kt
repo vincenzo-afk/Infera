@@ -1,5 +1,7 @@
 package com.chaosvoice.app
 
+import org.json.JSONObject
+
 /**
  * A complete set of DSP parameters describing a single voice-effect preset.
  *
@@ -158,5 +160,33 @@ data class Preset(
          */
         fun builtInById(id: String): Preset =
             ALL_BUILT_IN.find { it.id == id } ?: DEMON
+
+        /**
+         * Parses a Preset from a JSON string representation.
+         */
+        fun fromJson(jsonStr: String): Preset {
+            val json = JSONObject(jsonStr)
+            return Preset(
+                id                  = json.optString("id", "custom"),
+                name                = json.optString("name", "Custom"),
+                isBuiltIn           = json.optBoolean("isBuiltIn", false),
+                eqFrequency         = json.optDouble("eqFrequency", 2600.0).toFloat(),
+                eqQ                 = json.optDouble("eqQ", 5.0).toFloat(),
+                noiseMix            = json.optDouble("noiseMix", 0.35).toFloat(),
+                saturation1Gain     = json.optDouble("saturation1Gain", 12.0).toFloat(),
+                delayTimeMs         = json.optDouble("delayTimeMs", 25.0).toFloat(),
+                delayFeedback       = json.optDouble("delayFeedback", 0.65).toFloat(),
+                saturation2Gain     = json.optDouble("saturation2Gain", 4.0).toFloat(),
+                ringModHz           = json.optDouble("ringModHz", 800.0).toFloat(),
+                bitCrushDepth       = json.optDouble("bitCrushDepth", 4.0).toFloat(),
+                sampleRateTargetHz  = json.optDouble("sampleRateTargetHz", 8000.0).toFloat(),
+                pitchWobbleRateHz   = json.optDouble("pitchWobbleRateHz", 4.0).toFloat(),
+                pitchWobbleDepth    = json.optDouble("pitchWobbleDepth", 0.15).toFloat(),
+                vocoderMix          = json.optDouble("vocoderMix", 0.5).toFloat(),
+                burstProbability    = json.optDouble("burstProbability", 0.02).toFloat(),
+                hardClipThreshold   = json.optDouble("hardClipThreshold", 0.30).toFloat(),
+                boostPercent        = json.optDouble("boostPercent", 150.0).toFloat()
+            )
+        }
     }
 }

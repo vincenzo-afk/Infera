@@ -82,6 +82,33 @@ class ChaosProjectionService : Service() {
     private var audioThread: Thread? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    private val routingReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action ?: return
+            Log.i(TAG, "routingReceiver action=$action")
+            
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val hasHeadphones = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                am.isWiredHeadsetOn || am.isBluetoothA2dpOn
+            }
+
+            if (hasHeadphones && serviceState == ServiceState.ACTIVE) {
+                Log.w(TAG, "Unsupported routing detected (headphones/BT active) — terminating Chaos Mode")
+                broadcastError("ROUTING_UNSUPPORTED", 
+                    "Headphones or Bluetooth device connected. Chaos Mode requires the speakerphone to be active.")
+                cleanupAndStop()
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Service lifecycle
     // ─────────────────────────────────────────────────────────────────────────
@@ -98,16 +125,41 @@ class ChaosProjectionService : Service() {
                     if (stage != null) dsp.setParameter(stage, value)
                 }
                 "com.chaosvoice.app.LOAD_PRESET" -> {
-                    val pid = intent.getStringExtra("presetId") ?: return
-                    dsp.loadPreset(Preset.builtInById(pid))
+                    val presetJson = intent.getStringExtra("presetJson")
+                    val presetId   = intent.getStringExtra("presetId")
+                    val preset = when {
+                        presetJson != null -> {
+                            try {
+                                Preset.fromJson(presetJson)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed to parse presetJson on LOAD_PRESET: ${e.message}")
+                                null
+                            }
+                        }
+                        presetId != null -> Preset.builtInById(presetId)
+                        else -> null
+                    }
+                    if (preset != null) {
+                        dsp.loadPreset(preset)
+                    }
                 }
-                // Bug 3 fix: ACTIVE transition arrives here (service already in foreground from INIT),
-                // avoiding a second startForegroundService() call that re-triggers the mic-type
-                // permission check on OEM ROMs (MainActivity.startChaosMode now uses sendBroadcast).
                 "com.chaosvoice.app.START_CHAOS_MODE" -> {
-                    val presetId = intent.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
-                    val boost    = intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
-                    transitionToActive(presetId, boost)
+                    val presetJson = intent.getStringExtra("presetJson")
+                    val presetId   = intent.getStringExtra(EXTRA_PRESET)
+                    val boost      = intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
+                    val preset = when {
+                        presetJson != null -> {
+                            try {
+                                Preset.fromJson(presetJson)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Failed to parse presetJson on START_CHAOS_MODE: ${e.message}")
+                                Preset.DEMON
+                            }
+                        }
+                        presetId != null -> Preset.builtInById(presetId)
+                        else -> Preset.DEMON
+                    }
+                    transitionToActive(preset, boost)
                 }
             }
         }
@@ -131,11 +183,28 @@ class ChaosProjectionService : Service() {
         } else {
             registerReceiver(commandReceiver, filter)
         }
+
+        val routingFilter = android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_HEADSET_PLUG)
+            addAction("android.bluetooth.headset.profile.action.CONNECTION_STATE_CHANGED")
+            addAction("android.bluetooth.adapter.action.CONNECTION_STATE_CHANGED")
+            addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(routingReceiver, routingFilter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(routingReceiver, routingFilter)
+        }
         Log.i(TAG, "ChaosProjectionService created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val targetState = intent?.getStringExtra(EXTRA_TARGET_STATE) ?: STATE_INIT
+        if (intent == null) {
+            Log.w(TAG, "onStartCommand received null intent (sticky restart) — returning to STOPPED state")
+            cleanupAndStop()
+            return START_NOT_STICKY
+        }
+        val targetState = intent.getStringExtra(EXTRA_TARGET_STATE) ?: STATE_INIT
 
         // If targetState is STOPPED, satisfy the startForegroundService() OS contract
         // by calling startForeground() immediately before shutting down.
@@ -151,14 +220,8 @@ class ChaosProjectionService : Service() {
             return START_NOT_STICKY
         }
 
-        val presetId = intent?.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
-
-        // Bug fix: getFloatExtra returns primitive, so safe-check intent instead of unreachable ?: fallback
-        val boost = if (intent != null) {
-            intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
-        } else {
-            Preset.DEMON.boostPercent
-        }
+        val presetId = intent.getStringExtra(EXTRA_PRESET) ?: Preset.DEMON.id
+        val boost = intent.getFloatExtra(EXTRA_BOOST, Preset.DEMON.boostPercent)
 
         Log.i(TAG, "onStartCommand targetState=$targetState presetId=$presetId boost=$boost")
 
@@ -168,7 +231,10 @@ class ChaosProjectionService : Service() {
         when (targetState) {
             STATE_INIT -> transitionToInit()
             // STATE_ACTIVE path is dead from MainActivity, kept only for legacy deep-links / tests.
-            STATE_ACTIVE -> transitionToActive(presetId, boost)
+            STATE_ACTIVE -> {
+                val preset = Preset.builtInById(presetId)
+                transitionToActive(preset, boost)
+            }
         }
 
         return START_STICKY
@@ -231,15 +297,7 @@ class ChaosProjectionService : Service() {
      * ACTIVE: load preset, acquire focus, initialise audio devices, start processing loop.
      * All audio-device errors produce a clean stop + user-visible error (25_ERROR_HANDLING.md).
      */
-    private fun transitionToActive(presetId: String, boost: Float) {
-        // Load preset — fall back to Demon on corrupted data
-        val preset: Preset = try {
-            Preset.builtInById(presetId)
-        } catch (e: Exception) {
-            Log.w(TAG, "Preset load failed for '$presetId', falling back to Demon: ${e.message}")
-            broadcastError("PRESET_NOT_FOUND", "Couldn't load that preset — reverted to default.")
-            Preset.DEMON
-        }
+    private fun transitionToActive(preset: Preset, boost: Float) {
         dsp.loadPreset(preset)
         dsp.setParameter(ChaosDSP.Stage.BOOST_PERCENT, boost)
 
@@ -360,6 +418,7 @@ class ChaosProjectionService : Service() {
         isRunning.set(true)
         audioThread = Thread {
             try {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 // Bug fix: wrap setThreadPriority — some OEMs restrict URGENT_AUDIO for
                 // third-party apps and throw a SecurityException instead of silently failing.
                 try {
@@ -379,6 +438,17 @@ class ChaosProjectionService : Service() {
 
                 while (isRunning.get()) {
                     try {
+                        // ── Re-assert speakerphone route (Bug 7) ─────────────
+                        if (bufferCount % 25 == 0) {
+                            @Suppress("DEPRECATION")
+                            if (!am.isSpeakerphoneOn) {
+                                am.mode = AudioManager.MODE_NORMAL
+                                @Suppress("DEPRECATION")
+                                am.isSpeakerphoneOn = true
+                                Log.d(TAG, "Re-asserted speakerphone route mid-session")
+                            }
+                        }
+
                         val read = audioRecord?.read(captureBuffer, 0, BUFFER_SIZE_SAMPLES) ?: -1
                         if (read <= 0) {
                             // Underrun — skip gracefully, do not desync timing (10_AUDIO_PIPELINE.md)
@@ -525,6 +595,11 @@ class ChaosProjectionService : Service() {
         broadcastStateChange(STATE_STOPPED)
         try {
             unregisterReceiver(commandReceiver)
+        } catch (e: Exception) {
+            // Ignore
+        }
+        try {
+            unregisterReceiver(routingReceiver)
         } catch (e: Exception) {
             // Ignore
         }
