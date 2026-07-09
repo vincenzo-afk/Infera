@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -17,7 +16,6 @@ import 'native_audio_bridge.dart';
 class ChaosController extends ChangeNotifier {
   // ── App state ──────────────────────────────────────────────────────────────
 
-  /// Top-level app state per 17_STATE_MANAGEMENT.md.
   AppState _appState = AppState.idle;
   AppState get appState => _appState;
 
@@ -36,7 +34,7 @@ class ChaosController extends ChangeNotifier {
   // ── Volume boost ─────────────────────────────────────────────────────────
   double get boostLevel => _liveParams.boostPercent;
 
-  // ── Limiter (settings, 21_SETTINGS_AND_PRESETS.md) ───────────────────────
+  // ── Limiter ───────────────────────────────────────────────────────────────
   bool _limiterEnabled = true;
   bool get limiterEnabled => _limiterEnabled;
 
@@ -48,7 +46,7 @@ class ChaosController extends ChangeNotifier {
   String? _errorMessage;
   String? get errorMessage => _errorMessage;
 
-  // ── Custom presets (23_STORAGE_MODEL.md) ──────────────────────────────────
+  // ── Custom presets ────────────────────────────────────────────────────────
   List<PresetModel> _customPresets = [];
   List<PresetModel> get customPresets => _customPresets;
 
@@ -61,6 +59,11 @@ class ChaosController extends ChangeNotifier {
   StreamSubscription<Map<String, dynamic>>? _nativeEventSub;
   bool _onboardingDone = false;
   bool get onboardingDone => _onboardingDone;
+
+  /// Watchdog timer: if the service doesn't reach ACTIVE within this window
+  /// after startChaosMode is called, we abort and show an error.
+  Timer? _startupWatchdog;
+  static const _watchdogSeconds = 12;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Initialisation
@@ -81,7 +84,6 @@ class ChaosController extends ChangeNotifier {
     _limiterEnabled = prefs.getBool('limiter_enabled') ?? true;
     _vpnSurvivalEnabled = prefs.getBool('vpn_survival_enabled') ?? false;
 
-    // Load custom presets from JSON storage first to resolve custom active presets
     final rawCustom = prefs.getStringList('custom_presets') ?? [];
     _customPresets = rawCustom.map((s) {
       try {
@@ -93,16 +95,13 @@ class ChaosController extends ChangeNotifier {
 
     final lastPresetId = prefs.getString('active_preset_id') ?? 'demon';
     _activePreset = allPresets.firstWhere((p) => p.id == lastPresetId, orElse: () => PresetModel.demon);
-    
+
     final savedBoost = prefs.getDouble('boost_level') ?? _activePreset.boostPercent;
-    _liveParams   = _activePreset.copyWith(boostPercent: savedBoost);
+    _liveParams = _activePreset.copyWith(boostPercent: savedBoost);
 
     notifyListeners();
   }
 
-  /// Subscribes to the native EventChannel for Kotlin → Dart events.
-  /// Wrapped in try/catch so a [MissingPluginException] during the first-run
-  /// native setup doesn't propagate into unrelated async call stacks.
   void _subscribeToNativeEvents() {
     try {
       _nativeEventSub = NativeAudioBridge.nativeEvents.listen(
@@ -125,14 +124,10 @@ class ChaosController extends ChangeNotifier {
         },
         onError: (e) {
           debugPrint('[ChaosController] EventChannel error: $e');
-          // Do NOT call _setError here on first-run channel setup failures —
-          // the native side may not be ready until the service is started.
         },
         cancelOnError: false,
       );
     } catch (e) {
-      // MissingPluginException can be thrown synchronously if the channel
-      // is not yet registered (e.g., before MainActivity.onCreate completes).
       debugPrint('[ChaosController] EventChannel setup error (non-fatal): $e');
     }
   }
@@ -144,16 +139,32 @@ class ChaosController extends ChangeNotifier {
   void _handleServiceStateChanged(String nativeState) {
     switch (nativeState) {
       case 'INIT':
+        // Brief transient state — keep UI in initializing
         _setAppState(AppState.initializing);
         break;
       case 'ACTIVE':
+        // Service is fully running — cancel the watchdog and mark as running
+        _cancelWatchdog();
         _setAppState(AppState.running);
         _clearError();
+        // Request battery exemption AFTER ACTIVE — non-blocking, off critical path
+        _requestBatteryExemptionPostActivation();
         break;
       case 'STOPPED':
+        _cancelWatchdog();
         _setAppState(AppState.stopped);
         break;
     }
+  }
+
+  /// Requests battery optimization exemption after the service is confirmed ACTIVE.
+  /// This is intentionally fire-and-forget — it opens a system UI dialog that the
+  /// user can dismiss without affecting the running audio session.
+  void _requestBatteryExemptionPostActivation() {
+    NativeAudioBridge.requestBatteryOptimizationExemption().catchError((e) {
+      debugPrint('[ChaosController] Battery exemption request failed (non-fatal): $e');
+      return false;
+    });
   }
 
   void _handleFocusChanged(String focusState) {
@@ -165,6 +176,7 @@ class ChaosController extends ChangeNotifier {
         if (_appState == AppState.running) _setAppState(AppState.paused);
         break;
       case 'LOST':
+        _cancelWatchdog();
         _setAppState(AppState.stopped);
         break;
     }
@@ -172,6 +184,7 @@ class ChaosController extends ChangeNotifier {
 
   void _handleNativeError(String code, String message) {
     debugPrint('[ChaosController] Native error $code: $message');
+    _cancelWatchdog();
     _errorMessage = message;
     _setAppState(AppState.failure);
   }
@@ -181,11 +194,11 @@ class ChaosController extends ChangeNotifier {
   // ─────────────────────────────────────────────────────────────────────────
 
   /// Primary toggle: starts or stops Chaos Mode.
-  /// Implements the corrected permission sequence from ADR-004/14_PERMISSION_MODEL.md.
   Future<void> toggleChaosMode() async {
-    if (isLoading) return;  // Prevent double-taps during initialisation
-
     if (isActive || _appState == AppState.paused) {
+      await _stopChaosMode();
+    } else if (isLoading) {
+      // Allow user to cancel a stuck loading state
       await _stopChaosMode();
     } else {
       await _startChaosMode();
@@ -197,17 +210,10 @@ class ChaosController extends ChangeNotifier {
     _clearError();
 
     try {
-      // ── Step 1: Request POST_NOTIFICATIONS (Android 13+)
-      // Handled natively — returns true immediately on pre-Android 13 devices.
-      // Does NOT block startup if denied; the FGS notification requirement will
-      // surface a clearer error downstream if POST_NOTIFICATIONS is required.
+      // ── Step 1: POST_NOTIFICATIONS (Android 13+, non-blocking if denied)
       await NativeAudioBridge.requestNotificationPermission();
 
-      // ── Step 2: Request RECORD_AUDIO permission
-      // Bug 4 fix: mic permission MUST be granted before starting the foreground
-      // service (step 3). On Android 14, startForeground() on a microphone-typed
-      // FGS throws SecurityException if RECORD_AUDIO is not yet granted — this was
-      // the root cause of the "crashes to home screen" bug. See ADR-004.
+      // ── Step 2: RECORD_AUDIO — must be granted before FGS starts
       final micGranted = await NativeAudioBridge.requestRecordAudioPermission();
       if (!micGranted) {
         _setError('Microphone access is needed to use ChaosVoice. Tap to grant.');
@@ -215,47 +221,47 @@ class ChaosController extends ChangeNotifier {
         return;
       }
 
-      // ── Step 3: Start foreground service in INIT state (ADR-004)
-      // RECORD_AUDIO is now guaranteed granted, so startForeground() with
-      // foregroundServiceType=microphone will succeed on Android 14.
-      final serviceStarted = await NativeAudioBridge.startForegroundServiceOnly();
-      if (!serviceStarted) {
-        _setError('Notification permission is required for ChaosVoice to run in the background.');
-        _setAppState(AppState.failure);
-        return;
-      }
-
-      // ── Step 4: Battery optimization exemption
-      await NativeAudioBridge.requestBatteryOptimizationExemption();
-
-      // ── Step 5: Transition to ACTIVE
+      // ── Step 3: Start FGS + begin ACTIVE transition in one call.
+      // The service does INIT notification + transitionToActive() in onStartCommand,
+      // so there is no broadcast race. The service will emit INIT then ACTIVE events.
+      // We set a watchdog to fail gracefully if the ACTIVE event never arrives.
       final started = await NativeAudioBridge.startChaosMode(
         _activePreset.isBuiltIn ? _activePreset.id : _activePreset.toJson(),
         boostLevel,
       );
+
       if (!started) {
         _setError('Failed to start ChaosVoice. Please try again.');
         _setAppState(AppState.failure);
+        return;
       }
-      // State will be updated via onServiceStateChanged event from native side
+
+      // Start watchdog: if ACTIVE event doesn't arrive within _watchdogSeconds,
+      // auto-fail with a helpful error message.
+      _startWatchdog();
+
+      // State will be updated when native sends onServiceStateChanged(ACTIVE).
+      // Battery exemption is requested then, not here.
 
     } on PlatformException catch (e) {
       debugPrint('[ChaosController] PlatformException: ${e.code}: ${e.message}');
+      _cancelWatchdog();
       _setError(_friendlyError(e.code, e.message));
       _setAppState(AppState.failure);
     } catch (e) {
       debugPrint('[ChaosController] Unexpected error: $e');
+      _cancelWatchdog();
       _setError('An unexpected error occurred. Please restart the app.');
       _setAppState(AppState.failure);
     }
   }
 
   Future<void> _stopChaosMode() async {
+    _cancelWatchdog();
     try {
       await NativeAudioBridge.stopChaosMode();
       _setAppState(AppState.stopped);
     } on PlatformException catch (e) {
-      // SERVICE_NOT_RUNNING is non-fatal
       if (e.code == 'SERVICE_NOT_RUNNING') {
         _setAppState(AppState.stopped);
       } else {
@@ -264,21 +270,40 @@ class ChaosController extends ChangeNotifier {
     }
   }
 
+  // ── Watchdog timer ────────────────────────────────────────────────────────
+
+  void _startWatchdog() {
+    _cancelWatchdog();
+    _startupWatchdog = Timer(const Duration(seconds: _watchdogSeconds), () {
+      if (_appState == AppState.initializing) {
+        debugPrint('[ChaosController] Startup watchdog fired — service never reached ACTIVE');
+        _setError(
+          'ChaosVoice took too long to start. '
+          'Try stopping and starting again. If the problem persists, '
+          'check microphone permission and restart the app.',
+        );
+        _setAppState(AppState.failure);
+        // Attempt to stop the service so it doesn't linger in INIT
+        NativeAudioBridge.stopChaosMode().catchError((_) => false);
+      }
+    });
+  }
+
+  void _cancelWatchdog() {
+    _startupWatchdog?.cancel();
+    _startupWatchdog = null;
+  }
+
+  // ── Preset management ─────────────────────────────────────────────────────
+
   /// Selects a preset — applies immediately if active, otherwise saves for next start.
-  ///
-  /// Bug 8 partial fix: on any exception during the live update, BOTH [_activePreset]
-  /// and [_liveParams] are reverted to [PresetModel.demon] to keep Dart state consistent
-  /// with what the native side will have fallen back to. The two sequential native calls
-  /// (loadPreset then updateParameter) have no atomic guarantee, so a mid-sequence
-  /// failure could leave Dart and Kotlin in different states — this revert minimises drift.
   Future<void> selectPreset(PresetModel preset) async {
-    final previousPreset = _activePreset;
+    final previousPreset     = _activePreset;
     final previousLiveParams = _liveParams;
 
     _activePreset = preset;
     _liveParams   = preset;
 
-    // Persist last selection
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('active_preset_id', preset.id);
     await prefs.setDouble('boost_level', preset.boostPercent);
@@ -286,27 +311,24 @@ class ChaosController extends ChangeNotifier {
     if (isActive) {
       try {
         await NativeAudioBridge.loadPreset(preset.isBuiltIn ? preset.id : preset.toJson());
-        // Also update boost since presets have their own default boost
         await NativeAudioBridge.updateParameter('boostPercent', preset.boostPercent);
       } on PlatformException catch (e) {
         debugPrint('[ChaosController] loadPreset error: ${e.code}');
-        _setError('Couldn\'t load that preset — reverted to default.');
+        _setError("Couldn't load that preset — reverted to previous.");
         _activePreset = previousPreset;
         _liveParams   = previousLiveParams;
-        // Restore persisted values to match the revert
         await prefs.setString('active_preset_id', previousPreset.id);
         await prefs.setDouble('boost_level', previousLiveParams.boostPercent);
       } catch (e) {
         debugPrint('[ChaosController] loadPreset unexpected error: $e');
-        _setError('Couldn\'t load that preset — reverted to default.');
+        _setError("Couldn't load that preset — reverted to previous.");
         _activePreset = previousPreset;
         _liveParams   = previousLiveParams;
         await prefs.setString('active_preset_id', previousPreset.id);
         await prefs.setDouble('boost_level', previousLiveParams.boostPercent);
       }
-    } else {
-      _setError('Effects will apply once you activate Chaos Mode.');
     }
+    // No error shown if not active — preset is simply saved for next activation
 
     notifyListeners();
   }
@@ -321,17 +343,14 @@ class ChaosController extends ChangeNotifier {
 
     if (isActive) {
       await NativeAudioBridge.updateParameter('boostPercent', clamped);
-    } else {
-      _setError('Effects will apply once you activate Chaos Mode.');
     }
     notifyListeners();
   }
 
   /// Updates a single DSP parameter from an [EffectSlider] widget.
   Future<void> updateParameter(String stageKey, double value) async {
-    // Update live params in state (for UI reflection)
     _liveParams = _applyParam(_liveParams, stageKey, value);
-    
+
     if (stageKey == 'boostPercent') {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setDouble('boost_level', value);
@@ -343,8 +362,6 @@ class ChaosController extends ChangeNotifier {
       } on PlatformException catch (e) {
         debugPrint('[ChaosController] updateParameter error: ${e.code}');
       }
-    } else {
-      _setError('Effects will apply once you activate Chaos Mode.');
     }
     notifyListeners();
   }
@@ -364,8 +381,7 @@ class ChaosController extends ChangeNotifier {
       final raw = _customPresets.map((p) => jsonEncode(p.toJson())).toList();
       await prefs.setStringList('custom_presets', raw);
     } catch (e) {
-      // Storage write failure — preserve in-session state but show error
-      _setError('Couldn\'t save preset. Please try again.');
+      _setError("Couldn't save preset. Please try again.");
       _customPresets.removeLast();
     }
     notifyListeners();
@@ -384,11 +400,8 @@ class ChaosController extends ChangeNotifier {
   void resetToPresetDefaults() {
     _liveParams = _activePreset;
     notifyListeners();
-    // If active, reload preset on native side
     if (isActive) {
       NativeAudioBridge.loadPreset(_activePreset.isBuiltIn ? _activePreset.id : _activePreset.toJson());
-    } else {
-      _setError('Effects will apply once you activate Chaos Mode.');
     }
   }
 
@@ -405,7 +418,7 @@ class ChaosController extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ── VPN survival service (opt-in) ─────────────────────────────────────────
+  // ── VPN survival service ──────────────────────────────────────────────────
 
   Future<void> setVpnSurvivalEnabled(bool enabled) async {
     if (enabled) {
@@ -461,18 +474,15 @@ class ChaosController extends ChangeNotifier {
     _errorMessage = null;
   }
 
-  /// Maps error codes (16_METHOD_CHANNEL_PROTOCOL.md) to user-facing strings (25_ERROR_HANDLING.md).
   String _friendlyError(String code, String? raw) {
     return switch (code) {
       'PERMISSION_DENIED'    => 'Microphone access is needed to use ChaosVoice. Tap to grant.',
-      'AUDIO_INIT_FAILED'    => 'Couldn\'t access the microphone. Try restarting the app.',
+      'AUDIO_INIT_FAILED'    => "Couldn't access the microphone. Try restarting the app.",
       'FOCUS_DENIED'         => 'Another app is using audio right now.',
-      'PRESET_NOT_FOUND'     => 'Couldn\'t load that preset — reverted to default.',
+      'PRESET_NOT_FOUND'     => "Couldn't load that preset — reverted to default.",
       'SERVICE_NOT_RUNNING'  => 'ChaosVoice is not currently active.',
       'SERVICE_START_FAILED' => 'Notification permission is required for ChaosVoice to run in the background.',
-      // Bug 1/2 fix: FGS_START_FAILED is broadcast from transitionToInit() when
-      // startForeground() throws (e.g., mic permission not granted, OEM restriction).
-      'FGS_START_FAILED'     => 'ChaosVoice couldn\'t start the background service. '
+      'FGS_START_FAILED'     => "ChaosVoice couldn't start the background service. "
                                 'Ensure microphone permission is granted and try again.',
       _                      => raw ?? 'An unexpected error occurred. Please restart the app.',
     };
@@ -503,6 +513,7 @@ class ChaosController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _cancelWatchdog();
     _nativeEventSub?.cancel();
     super.dispose();
   }

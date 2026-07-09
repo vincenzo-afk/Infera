@@ -131,8 +131,8 @@ class EffectEngine {
     }
 
     // ── Stage 3: Saturation 1 ────────────────────────────────────────────
-    final g1 = saturation1Gain.clamp(0.1, 50);
-    final t1 = _tanh(g1).abs().clamp(1e-9, double.infinity);
+    final g1 = saturation1Gain.clamp(0.1, 50).toDouble();
+    final t1 = _tanh(g1).abs().clamp(1e-9, double.infinity).toDouble();
     for (var i = 0; i < len; i++) work[i] = _tanh(g1 * work[i]) / t1;
 
     // ── Stage 4: Feedback Delay ──────────────────────────────────────────
@@ -148,8 +148,8 @@ class EffectEngine {
     }
 
     // ── Stage 5: Saturation 2 ────────────────────────────────────────────
-    final g2 = saturation2Gain.clamp(0.1, 20);
-    final t2 = _tanh(g2).abs().clamp(1e-9, double.infinity);
+    final g2 = saturation2Gain.clamp(0.1, 20).toDouble();
+    final t2 = _tanh(g2).abs().clamp(1e-9, double.infinity).toDouble();
     for (var i = 0; i < len; i++) work[i] = _tanh(g2 * work[i]) / t2;
 
     // ── Stage 6: Ring Modulation ─────────────────────────────────────────

@@ -18,15 +18,14 @@ import io.flutter.plugin.common.MethodChannel
 /**
  * ChaosVoice main activity — bridges Flutter (Dart) and native Android.
  *
- * Sets up:
- *   - MethodChannel  "com.chaosvoice/audio"  (Dart → Kotlin commands)
- *   - EventChannel   "com.chaosvoice/events" (Kotlin → Dart state/error events)
+ * MethodChannel  "com.chaosvoice/audio"  — Dart → Kotlin commands
+ * EventChannel   "com.chaosvoice/events" — Kotlin → Dart state/error events
  *
- * All method names and argument shapes match 16_METHOD_CHANNEL_PROTOCOL.md exactly.
- *
- * Threading (13_THREADING_MODEL.md):
- *   MethodChannel handlers run on the Android main thread. Any long-running native
- *   work (starting the audio loop) is offloaded to the service's dedicated thread.
+ * Startup sequence (fixed, eliminates broadcast race):
+ *   1. requestNotificationPermission
+ *   2. requestRecordAudioPermission
+ *   3. startChaosMode (starts FGS with preset + boost in the intent — no second broadcast)
+ *   Battery exemption is requested AFTER confirming ACTIVE via event, not on the critical path.
  */
 class MainActivity : FlutterActivity() {
 
@@ -35,38 +34,29 @@ class MainActivity : FlutterActivity() {
         private const val METHOD_CHANNEL_NAME = "com.chaosvoice/audio"
         private const val EVENT_CHANNEL_NAME  = "com.chaosvoice/events"
 
-        // Activity result codes
         private const val REQ_RECORD_AUDIO    = 101
         private const val REQ_VPN_PERMISSION  = 102
         private const val REQ_POST_NOTIF      = 103
 
         // Static EventSink — set when Flutter subscribes to the EventChannel.
-        // Used by ChaosProjectionService to push events back to Dart.
         @Volatile private var eventSink: EventChannel.EventSink? = null
 
-        // Pending MethodChannel results for permissions that require a callback.
-        // Bug 9 fix: each field is set to null immediately before calling success()/error()
-        // to prevent IllegalStateException("Reply already submitted") if a callback fires
-        // twice (e.g., from a stale result after a crash-and-relaunch mid-dialog).
+        // Pending MethodChannel results for permissions requiring a callback.
+        // Null-before-dispatch pattern prevents IllegalStateException on double-dispatch.
         private var pendingResultAudio: MethodChannel.Result? = null
         private var pendingResultVpn: MethodChannel.Result? = null
         private var pendingResultNotification: MethodChannel.Result? = null
 
-        // ── Static helpers called by ChaosProjectionService ───────────────
-
-        /** Sends a service-state-changed event to the Flutter layer. */
         @JvmStatic
         fun sendServiceStateEvent(state: String) {
             eventSink?.success(mapOf("type" to "onServiceStateChanged", "state" to state))
         }
 
-        /** Sends an audio-focus-changed event to the Flutter layer. */
         @JvmStatic
         fun sendFocusEvent(focusState: String) {
             eventSink?.success(mapOf("type" to "onAudioFocusChanged", "focusState" to focusState))
         }
 
-        /** Sends an error event to the Flutter layer. */
         @JvmStatic
         fun sendErrorEvent(code: String, message: String) {
             eventSink?.success(mapOf("type" to "onError", "code" to code, "message" to message))
@@ -80,14 +70,12 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        // ── MethodChannel: Dart → Kotlin ─────────────────────────────────
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL_NAME)
             .setMethodCallHandler { call, result ->
                 Log.d(TAG, "MethodChannel: ${call.method} args=${call.arguments}")
                 handleMethodCall(call.method, call.arguments, result)
             }
 
-        // ── EventChannel: Kotlin → Dart ──────────────────────────────────
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL_NAME)
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, sink: EventChannel.EventSink?) {
@@ -102,7 +90,7 @@ class MainActivity : FlutterActivity() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MethodChannel dispatch (16_METHOD_CHANNEL_PROTOCOL.md)
+    // MethodChannel dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun handleMethodCall(
@@ -115,17 +103,13 @@ class MainActivity : FlutterActivity() {
 
         when (method) {
 
-            // ── requestNotificationPermission ────────────────────────────
-            // Step 1 of the corrected permission sequence (ADR-004, 14_PERMISSION_MODEL.md).
-            // On Android 13+ (TIRAMISU), POST_NOTIFICATIONS is a runtime permission.
-            // On earlier versions it is automatically granted, so we return true immediately.
+            // ── requestNotificationPermission ────────────────────────────────
             "requestNotificationPermission" -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS)
                         == PackageManager.PERMISSION_GRANTED
                     ) {
                         result.success(true)
-                        Log.i("[ChaosVoice][PERMS]", "POST_NOTIFICATIONS already granted")
                     } else {
                         pendingResultNotification = result
                         ActivityCompat.requestPermissions(
@@ -135,36 +119,16 @@ class MainActivity : FlutterActivity() {
                         )
                     }
                 } else {
-                    // Pre-Android 13: notification permission is automatically granted.
                     result.success(true)
                 }
             }
 
-            // ── startForegroundServiceOnly ───────────────────────────────
-            // Start service in INIT state (no audio) — step 3 of corrected permission
-            // sequence (ADR-004). RECORD_AUDIO must already be granted before this point.
-            "startForegroundServiceOnly" -> {
-                try {
-                    startChaosService(ChaosProjectionService.STATE_INIT)
-                    result.success(true)
-                    Log.i(TAG, "Foreground service started in INIT state")
-                } catch (e: Exception) {
-                    Log.e(TAG, "startForegroundServiceOnly failed: ${e.message}")
-                    result.error("SERVICE_START_FAILED", e.message, null)
-                }
-            }
-
-            // ── requestRecordAudioPermission ─────────────────────────────
-            // Step 2 of the corrected permission sequence (ADR-004, 14_PERMISSION_MODEL.md).
-            // Must be requested BEFORE startForegroundServiceOnly on Android 14+ so that
-            // RECORD_AUDIO is granted at the moment startForeground() is called on a
-            // microphone-typed foreground service.
+            // ── requestRecordAudioPermission ─────────────────────────────────
             "requestRecordAudioPermission" -> {
                 if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
                     == PackageManager.PERMISSION_GRANTED
                 ) {
                     result.success(true)
-                    Log.i("[ChaosVoice][PERMS]", "RECORD_AUDIO already granted")
                 } else {
                     pendingResultAudio = result
                     ActivityCompat.requestPermissions(
@@ -175,39 +139,63 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // ── startChaosMode ───────────────────────────────────────────
-            // Bug 3 fix: send START_CHAOS_MODE broadcast to the already-running service
-            // instead of calling startForegroundService(STATE_ACTIVE).
+            // ── startForegroundServiceOnly ───────────────────────────────────
+            // Kept for backward compatibility. Now unused by the main startup flow.
+            "startForegroundServiceOnly" -> {
+                try {
+                    startChaosService(ChaosProjectionService.STATE_INIT)
+                    result.success(true)
+                } catch (e: Exception) {
+                    Log.e(TAG, "startForegroundServiceOnly failed: ${e.message}")
+                    result.error("SERVICE_START_FAILED", e.message, null)
+                }
+            }
+
+            // ── startChaosMode ───────────────────────────────────────────────
+            // Starts the FGS with full preset + boost information in the intent.
+            // The service does INIT notification + ACTIVE transition in onStartCommand,
+            // eliminating the previous START_CHAOS_MODE broadcast race condition.
             "startChaosMode" -> {
                 val presetObj  = args["preset"]
                 val boostLevel = (args["boostLevel"] as? Number)?.toFloat() ?: 150f
                 try {
-                    val broadcastIntent = Intent("com.chaosvoice.app.START_CHAOS_MODE").apply {
-                        `package` = packageName
-                        if (presetObj is Map<*, *>) {
-                            @Suppress("UNCHECKED_CAST")
-                            val presetMap = presetObj as Map<String, Any>
-                            putExtra("presetJson", org.json.JSONObject(presetMap).toString())
-                        } else if (presetObj is String) {
-                            putExtra(ChaosProjectionService.EXTRA_PRESET, presetObj)
-                        } else {
-                            putExtra(ChaosProjectionService.EXTRA_PRESET, Preset.DEMON.id)
-                        }
+                    val intent = Intent(this, ChaosProjectionService::class.java).apply {
+                        putExtra(ChaosProjectionService.EXTRA_TARGET_STATE, ChaosProjectionService.STATE_ACTIVE)
                         putExtra(ChaosProjectionService.EXTRA_BOOST, boostLevel)
+                        when {
+                            presetObj is Map<*, *> -> {
+                                @Suppress("UNCHECKED_CAST")
+                                val presetMap = presetObj as Map<String, Any>
+                                putExtra(
+                                    ChaosProjectionService.EXTRA_PRESET_JSON,
+                                    org.json.JSONObject(presetMap).toString()
+                                )
+                            }
+                            presetObj is String -> {
+                                putExtra(ChaosProjectionService.EXTRA_PRESET, presetObj)
+                            }
+                            else -> {
+                                putExtra(ChaosProjectionService.EXTRA_PRESET, Preset.DEMON.id)
+                            }
+                        }
                     }
-                    sendBroadcast(broadcastIntent)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    Log.i(TAG, "startChaosMode: service launched with preset=$presetObj boost=$boostLevel")
                     result.success(true)
                 } catch (e: Exception) {
-                    Log.e(TAG, "startChaosMode broadcast failed: ${e.message}")
+                    Log.e(TAG, "startChaosMode failed: ${e.message}")
                     result.error("AUDIO_INIT_FAILED", e.message, null)
                 }
             }
 
-            // ── stopChaosMode ────────────────────────────────────────────
+            // ── stopChaosMode ────────────────────────────────────────────────
             "stopChaosMode" -> {
                 try {
-                    val intent = Intent(this, ChaosProjectionService::class.java)
-                    stopService(intent)
+                    stopService(Intent(this, ChaosProjectionService::class.java))
                     result.success(true)
                 } catch (e: Exception) {
                     Log.e(TAG, "stopChaosMode failed: ${e.message}")
@@ -215,13 +203,13 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // ── updateParameter ──────────────────────────────────────────
-            // Live DSP parameter update from a slider change.
+            // ── updateParameter ──────────────────────────────────────────────
             "updateParameter" -> {
                 val stageKey = args["stage"] as? String ?: ""
                 val value    = (args["value"] as? Number)?.toFloat() ?: 0f
                 val stage    = ChaosDSP.Stage.fromKey(stageKey)
                 if (stage == null) {
+                    Log.w(TAG, "updateParameter: unknown stage '$stageKey'")
                     result.error("INVALID_STAGE", "Unknown stage: $stageKey", null)
                 } else {
                     sendParameterUpdate(stageKey, value)
@@ -229,21 +217,21 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // ── loadPreset ───────────────────────────────────────────────
+            // ── loadPreset ───────────────────────────────────────────────────
             "loadPreset" -> {
                 val presetObj = args["preset"]
-                val presetId = args["presetId"] as? String
                 try {
                     val broadcastIntent = Intent("com.chaosvoice.app.LOAD_PRESET").apply {
                         `package` = packageName
-                        if (presetObj is Map<*, *>) {
-                            @Suppress("UNCHECKED_CAST")
-                            val presetMap = presetObj as Map<String, Any>
-                            putExtra("presetJson", org.json.JSONObject(presetMap).toString())
-                        } else if (presetObj is String) {
-                            putExtra("presetId", presetObj)
-                        } else if (presetId != null) {
-                            putExtra("presetId", presetId)
+                        when {
+                            presetObj is Map<*, *> -> {
+                                @Suppress("UNCHECKED_CAST")
+                                val presetMap = presetObj as Map<String, Any>
+                                putExtra("presetJson", org.json.JSONObject(presetMap).toString())
+                            }
+                            presetObj is String -> {
+                                putExtra("presetId", presetObj)
+                            }
                         }
                     }
                     sendBroadcast(broadcastIntent)
@@ -253,24 +241,27 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // ── requestBatteryOptimizationExemption ──────────────────────
-            // Step 4 of permission sequence (ADR-004, 14_PERMISSION_MODEL.md)
+            // ── requestBatteryOptimizationExemption ──────────────────────────
+            // Called AFTER ACTIVE state is confirmed — no longer on the critical startup path.
             "requestBatteryOptimizationExemption" -> {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    val intent = Intent(
-                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                        android.net.Uri.parse("package:${packageName}")
-                    )
-                    startActivity(intent)
+                    try {
+                        val intent = Intent(
+                            android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            android.net.Uri.parse("package:${packageName}")
+                        )
+                        startActivity(intent)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Battery exemption intent failed (non-fatal): ${e.message}")
+                    }
                 }
                 result.success(true)
             }
 
-            // ── requestVpnPermission (ChaosVpnService opt-in) ────────────
+            // ── requestVpnPermission ─────────────────────────────────────────
             "requestVpnPermission" -> {
                 val vpnIntent = VpnService.prepare(this)
                 if (vpnIntent == null) {
-                    // Already granted
                     result.success(true)
                 } else {
                     pendingResultVpn = result
@@ -278,26 +269,23 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
-            // ── startVpnSurvivalService ───────────────────────────────────
+            // ── startVpnSurvivalService ──────────────────────────────────────
             "startVpnSurvivalService" -> {
                 try {
                     val prefs = getSharedPreferences("chaosvoice_prefs", Context.MODE_PRIVATE)
                     prefs.edit().putBoolean("vpn_survival_enabled", true).apply()
-
-                    val intent = Intent(this, ChaosVpnService::class.java)
-                    ContextCompat.startForegroundService(this, intent)
+                    ContextCompat.startForegroundService(this, Intent(this, ChaosVpnService::class.java))
                     result.success(true)
                 } catch (e: Exception) {
                     result.error("SERVICE_START_FAILED", e.message, null)
                 }
             }
 
-            // ── stopVpnSurvivalService ───────────────────────────────────
+            // ── stopVpnSurvivalService ───────────────────────────────────────
             "stopVpnSurvivalService" -> {
                 try {
                     val prefs = getSharedPreferences("chaosvoice_prefs", Context.MODE_PRIVATE)
                     prefs.edit().putBoolean("vpn_survival_enabled", false).apply()
-
                     stopService(Intent(this, ChaosVpnService::class.java))
                     result.success(true)
                 } catch (e: Exception) {
@@ -310,7 +298,7 @@ class MainActivity : FlutterActivity() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Service start helper
+    // Service start helper (used for legacy INIT-only path)
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun startChaosService(
@@ -339,14 +327,6 @@ class MainActivity : FlutterActivity() {
         sendBroadcast(intent)
     }
 
-    private fun sendPresetLoad(presetId: String) {
-        val intent = Intent("com.chaosvoice.app.LOAD_PRESET").apply {
-            `package` = packageName
-            putExtra("presetId", presetId)
-        }
-        sendBroadcast(intent)
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
     // Permission result callbacks
     // ─────────────────────────────────────────────────────────────────────────
@@ -361,10 +341,7 @@ class MainActivity : FlutterActivity() {
             REQ_RECORD_AUDIO -> {
                 val granted = grantResults.isNotEmpty() &&
                               grantResults[0] == PackageManager.PERMISSION_GRANTED
-                Log.i("[ChaosVoice][PERMS]", "RECORD_AUDIO granted=$granted")
-                // Bug 9 fix: capture and null-out the pending result before calling success()
-                // to prevent IllegalStateException("Reply already submitted") if this callback
-                // fires a second time (e.g., process relaunch after FGS crash mid-dialog).
+                Log.i(TAG, "RECORD_AUDIO granted=$granted")
                 val pending = pendingResultAudio
                 pendingResultAudio = null
                 pending?.success(granted)
@@ -372,8 +349,7 @@ class MainActivity : FlutterActivity() {
             REQ_POST_NOTIF -> {
                 val granted = grantResults.isNotEmpty() &&
                               grantResults[0] == PackageManager.PERMISSION_GRANTED
-                Log.i("[ChaosVoice][PERMS]", "POST_NOTIFICATIONS granted=$granted")
-                // Bug 9 fix: same null-before-dispatch pattern.
+                Log.i(TAG, "POST_NOTIFICATIONS granted=$granted")
                 val pending = pendingResultNotification
                 pendingResultNotification = null
                 pending?.success(granted)
@@ -386,8 +362,7 @@ class MainActivity : FlutterActivity() {
         when (requestCode) {
             REQ_VPN_PERMISSION -> {
                 val granted = resultCode == Activity.RESULT_OK
-                Log.i("[ChaosVoice][PERMS]", "VPN permission granted=$granted")
-                // Bug 9 fix: capture and null-out before dispatch.
+                Log.i(TAG, "VPN permission granted=$granted")
                 val pending = pendingResultVpn
                 pendingResultVpn = null
                 pending?.success(granted)

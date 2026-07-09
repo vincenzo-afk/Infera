@@ -3,7 +3,6 @@ import 'package:provider/provider.dart';
 import '../chaos_controller.dart';
 import '../models/preset_model.dart';
 import '../widgets/effect_sliders_widget.dart';
-import '../widgets/volume_boost_widget.dart';
 
 /// Primary interaction surface for ChaosVoice.
 ///
